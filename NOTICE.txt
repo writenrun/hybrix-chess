@@ -1,0 +1,8 @@
+Hybrix Chess
+Copyright (c) Write 'n' Run LLC
+
+Unless otherwise stated, the source code in this repository is licensed
+under the terms found in LICENSE.txt.
+
+The names "Chombit", "Hybrix", "Jamdac", "Palix", "Write 'n' Run", and
+the Hybrix logo are trademarks of Write 'n' Run LLC.
