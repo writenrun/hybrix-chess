@@ -1,0 +1,448 @@
+module hud
+  const color_normal is 1        # theme 1, color A white (7)
+  const color_hover is 6         # theme 6, color A cyan (20)
+
+  # The matte text color, a system palette index (1 = black).
+  const matte_text_color is 1
+
+  # Click/hover zones
+  const zone_none is -1
+  const zone_white is 0     # the White:Human|Robot field
+  const zone_black is 1
+  const zone_undo is 2      # cols 26-29
+  const zone_new is 3       # cols 31-33
+  const zone_about is 4     # cols 35-39, the status slot when Check is absent
+  const zone_message is 5   # the whole bar, during a search only
+  const zone_easy is 6      # cols 20-23, difficulty question only
+  const zone_medium is 7    # cols 25-30, difficulty question only
+  const zone_hard is 8      # cols 32-35, difficulty question only
+  const zone_yes is 9       # cols 33-35, restart question only
+  const zone_no is 10       # cols 38-39, either question
+
+  # While a question is open it takes the message region
+  const question_none is 0
+  const question_robot_white is 1
+  const question_robot_black is 2
+  const question_restart is 3
+  const question_about is 4
+
+  const screen_cols is 40
+  const screen_rows is 28
+
+  # The about box is a centered rectangle of console cells.
+  const about_width is 30
+  const about_col is (hud::screen_cols - hud::about_width) / 2
+
+  # Indexes into the _verdict_text[] and _neutral_verdict_text[] tables
+  const verdict_playing is 0
+  const verdict_white_won is 1
+  const verdict_black_won is 2
+  const verdict_stalemate is 3
+  const verdict_fifty is 4
+
+  # The difficulty level determines the search duration
+  const level_easy is 0
+  const level_medium is 1
+  const level_hard is 2
+
+  var level_ms: int[]
+  var level_names: string[]
+
+  var _about_text: string[]
+
+  # Indexed by verdict.  The default wording asserts why the game ended, a
+  # claim the bar cannot verify about a subclass that assigns .status on its
+  # own terms; neutral_verdicts switches to wording that does not.
+  var _verdict_text: string[]
+  var _neutral_verdict_text: string[]
+
+  # Set at the engine instantiation site in main::setup().
+  var neutral_verdicts: bool
+
+  var white_is_robot: bool
+  var black_is_robot: bool
+  var white_level: byte
+  var black_level: byte
+
+  var question: int
+  var verdict: int
+
+  # The live zone under the wand tip, or zone_none.  The hover highlight is
+  # the only affordance telling a beginner that the fields are controls, so it
+  # applies to the fields as well as the buttons.
+  var hover_zone: int
+
+  # The main loop repaints the bar once per frame at most.
+  var dirty: bool
+
+  # ---------------------------------------------------------------------------
+  func init()
+    io::matte_color <- hud::matte_text_color
+
+    hud::hover_zone <- hud::zone_none
+    hud::question <- hud::question_none
+    hud::verdict <- hud::verdict_playing
+    hud::white_level <- hud::level_easy
+    hud::black_level <- hud::level_easy
+    hud::dirty <- true
+  end func
+
+  # ---------------------------------------------------------------------------
+  func is_robot(side: color): bool
+    if side = color::white
+    do return hud::white_is_robot
+
+    return hud::black_is_robot
+  end func
+
+  func get_side_level(side: color): byte
+    if side = color::white
+    do return hud::white_level
+
+    return hud::black_level
+  end func
+
+  func get_level_ms(level: byte): int
+    return hud::level_ms[level]
+  end func
+
+  func get_level_name(level: byte): string
+    return hud::level_names[level]
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Maps a bar column to the live zone it belongs to.  Inert content returns
+  # zone_none.  print_top_bar() paints the same modes in the same order.
+  func get_zone_at_col(col: int): int
+    # During a search the whole bar is one control meaning "Move now": an
+    # eight-column label is an unkind thing to ask a beginner to hit.
+    if main::ui_state = ui_state::thinking
+    do return hud::zone_message
+
+    var q: int
+    q <- hud::question
+
+    if q = hud::question_robot_white or q = hud::question_robot_black then
+      if col >= 20 and col <= 23
+      do return hud::zone_easy
+
+      if col >= 25 and col <= 30
+      do return hud::zone_medium
+
+      if col >= 32 and col <= 35
+      do return hud::zone_hard
+
+      if col >= 38 and col <= 39
+      do return hud::zone_no
+
+      return hud::zone_none
+    end if
+
+    if q = hud::question_restart then
+      if col >= 33 and col <= 35
+      do return hud::zone_yes
+
+      if col >= 38 and col <= 39
+      do return hud::zone_no
+
+      return hud::zone_none
+    end if
+
+    # The box is dismissed by clicking anywhere, so nothing to aim at.
+    if q = hud::question_about
+    do return hud::zone_none
+
+    # Undo and New keep their columns whether or not the game has ended.
+    if col >= 26 and col <= 29 and main::get_undo_plies() > 0
+    do return hud::zone_undo
+
+    if col >= 31 and col <= 33
+    do return hud::zone_new
+
+    if col >= 35 and col <= 39 and not hud::_showing_check()
+    do return hud::zone_about
+
+    # The fields are the only part an ending takes away, and they also need
+    # an engine that can take a side.
+    if hud::verdict = hud::verdict_playing
+    | and main::chess_engine.can_find_move then
+      if col >= 1 and col <= 11
+      do return hud::zone_white
+
+      if col >= 13 and col <= 23
+      do return hud::zone_black
+    end if
+
+    return hud::zone_none
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Fixed columns; nothing ever shifts.  Every mode's segments cover exactly
+  # columns 0..39.
+  func print_top_bar()
+    console::reverse <- true
+    console::matte <- true
+
+    var q: int
+    q <- hud::question
+
+    if main::ui_state = ui_state::thinking then
+      hud::_print_thinking()
+    elsif q = hud::question_robot_white or q = hud::question_robot_black then
+      hud::_print_robot_question(q)
+    elsif q = hud::question_restart then
+      hud::_print_zone(0, 0, 33, "Restart the game?", hud::zone_none)
+      hud::_print_zone(0, 33, 3, "Yes", hud::zone_yes)
+      hud::_print_zone(0, 36, 2, "", hud::zone_none)
+      hud::_print_zone(0, 38, 2, "No", hud::zone_no)
+    elsif q = hud::question_about then
+      # Redrawn with the bar rather than only when it opens, so the display
+      # stays derived from the current mode.
+      hud::_print_about_box()
+      hud::_print_zone(0, 0, 40, "About this game", hud::zone_none)
+    elsif hud::verdict <> hud::verdict_playing then
+      # About is not position dependent, so the right block survives an ending.
+      hud::_print_zone(0, 0, 26, hud::_get_verdict_text(), hud::zone_none)
+      hud::_print_right_block()
+    else
+      hud::_print_playing()
+    end if
+
+    console::reverse <- false
+    console::matte <- false
+    console::set_color(hud::color_normal)
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _print_thinking()
+    hud::_set_zone_color(hud::zone_message)
+    console::goto_bookmark(to_pair(0))
+
+    var side: color
+    side <- main::position.side_to_move
+
+    if side = color::white then
+      console::print("White thinking (")
+    else
+      console::print("Black thinking (")
+    end if
+
+    var name: string
+    name <- hud::get_level_name(hud::get_side_level(side))
+    console::print(name)
+    console::print(")")
+
+    var length: int
+    length <- 17 + name.size
+    loop
+      if length >= 26
+      do drop
+
+      console::print_char(' ')
+      length <- length + 1
+    end loop
+
+    console::print("Move now [ESC]")
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _print_robot_question(q: int)
+    if q = hud::question_robot_white then
+      hud::_print_zone(0, 0, 20, "Robot as White?", hud::zone_none)
+    else
+      hud::_print_zone(0, 0, 20, "Robot as Black?", hud::zone_none)
+    end if
+
+    hud::_print_zone(0, 20, 4, "Easy", hud::zone_easy)
+    hud::_print_zone(0, 24, 1, "", hud::zone_none)
+    hud::_print_zone(0, 25, 6, "Medium", hud::zone_medium)
+    hud::_print_zone(0, 31, 1, "", hud::zone_none)
+    hud::_print_zone(0, 32, 4, "Hard", hud::zone_hard)
+    hud::_print_zone(0, 36, 2, "", hud::zone_none)
+    hud::_print_zone(0, 38, 2, "No", hud::zone_no)
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _print_playing()
+    var white_to_move: bool
+    white_to_move <- main::position.side_to_move = color::white
+
+    if white_to_move then
+      hud::_print_zone(0, 0, 1, "{$84}", hud::zone_none)
+    else
+      hud::_print_zone(0, 0, 1, "", hud::zone_none)
+    end if
+
+    if hud::white_is_robot then
+      hud::_print_zone(0, 1, 11, "White:Robot", hud::zone_white)
+    else
+      hud::_print_zone(0, 1, 11, "White:Human", hud::zone_white)
+    end if
+
+    if white_to_move then
+      hud::_print_zone(0, 12, 1, "", hud::zone_none)
+    else
+      hud::_print_zone(0, 12, 1, "{$84}", hud::zone_none)
+    end if
+
+    if hud::black_is_robot then
+      hud::_print_zone(0, 13, 11, "Black:Robot", hud::zone_black)
+    else
+      hud::_print_zone(0, 13, 11, "Black:Human", hud::zone_black)
+    end if
+
+    hud::_print_zone(0, 24, 2, "", hud::zone_none)
+    hud::_print_right_block()
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _showing_check(): bool
+    return hud::verdict = hud::verdict_playing and main::chess_engine.in_check
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Columns 26-39.  Undo is the only one of the three that can vanish.
+  func _print_right_block()
+    if main::get_undo_plies() > 0 then
+      hud::_print_zone(0, 26, 4, "Undo", hud::zone_undo)
+    else
+      hud::_print_zone(0, 26, 4, "", hud::zone_none)
+    end if
+
+    hud::_print_zone(0, 30, 1, "", hud::zone_none)
+    hud::_print_zone(0, 31, 3, "New", hud::zone_new)
+    hud::_print_zone(0, 34, 1, "", hud::zone_none)
+
+    if hud::_showing_check() then
+      hud::_print_zone(0, 35, 5, "Check", hud::zone_none)
+    else
+      hud::_print_zone(0, 35, 5, "About", hud::zone_about)
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _get_verdict_text(): string
+    if hud::neutral_verdicts
+    do return hud::_neutral_verdict_text[hud::verdict]
+
+    return hud::_verdict_text[hud::verdict]
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _set_zone_color(zone: int)
+    if zone <> hud::zone_none and zone = hud::hover_zone then
+      console::set_color(hud::color_hover)
+    else
+      console::set_color(hud::color_normal)
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _print_about_box()
+    var lines: string[]
+    lines <- hud::_about_text
+
+    var height: int
+    height <- lines.size + 2
+
+    # Rounding down puts the extra row below the box, where a reader expects
+    # the slack to fall.
+    var top: int
+    top <- (hud::screen_rows - height) / 2
+
+    var row: int
+    row <- 0
+    loop
+      if row >= height
+      do drop
+
+      hud::_print_zone(top + row, hud::about_col,
+      | hud::about_width, "", hud::zone_none)
+
+      row <- row + 1
+    end loop
+
+    console::set_color(hud::color_normal)
+
+    var i: int
+    i <- 0
+    loop
+      if i >= lines.size
+      do drop
+
+      # The one-column margin is geometry, so it lives in this "+ 1".
+      console::goto_bookmark(
+      | to_pair((top + 1 + i) * 64 + hud::about_col + 1))
+      console::print(lines[i])
+
+      i <- i + 1
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  func close_about()
+    console::print_char('{cls}')
+    hud::print_top_bar()
+    hud::dirty <- false
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Prints one segment at a fixed row and column, padded to its width.  Every
+  # bar caller passes row 0; the about box passes its own rows.
+  func _print_zone(row: int, col: int, width: int, s: string, zone: int)
+    hud::_set_zone_color(zone)
+
+    # The console grid is 64 cells wide, whatever the screen shows.
+    console::goto_bookmark(to_pair(row * 64 + col))
+    console::print(s)
+
+    var i: int
+    i <- s.size
+    loop
+      if i >= width
+      do drop
+
+      console::print_char(' ')
+      i <- i + 1
+    end loop
+  end func
+end module
+
+data hud::level_ms
+[
+  2000,   # Easy
+  8000,   # Medium
+  30000   # Hard
+]
+end data
+
+data hud::level_names
+[ "Easy", "Medium", "Hard" ]
+end data
+
+data hud::_verdict_text
+[
+  "",                       # playing
+  "Checkmate! White wins",
+  "Checkmate! Black wins",
+  "Draw: no legal moves",   # stalemate
+  "Draw: fifty-move rule"
+]
+end data
+
+data hud::_neutral_verdict_text
+[ "", "White wins", "Black wins", "Draw", "Draw" ]
+end data
+
+data hud::_about_text
+[
+  "Chombit Chess {$97} 2026-08-01",
+  "",
+  "{(c)} 2026 Write 'n' Run LLC",
+  "Artwork by ZaniPixels",
+  "Micro-Max 3.2 by H.G. Muller",
+  "",
+  "For docs and license, visit:",
+  "hybrix.dev/ref/chess-demo"
+]
+end data

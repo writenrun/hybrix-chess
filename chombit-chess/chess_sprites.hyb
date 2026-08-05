@@ -1,0 +1,184 @@
+class piece_actor extends actor
+  const speed is 3
+
+  var _from_x: int, _from_y: int
+  var _to_x: int, _to_y: int
+  var _step: int, _step_count: int
+
+  # ---------------------------------------------------------------------------
+  # Slide to (x, y) at a steady rate, in a straight line on the screen.
+  func animate_to(x: int, y: int)
+    ._from_x <- .x
+    ._from_y <- .y
+    ._to_x <- x
+    ._to_y <- y
+    ._step <- 0
+
+    var dx: int, dy: int, distance: int
+    dx <- math::abs(x - .x)
+    dy <- math::abs(y - .y)
+    if dx >= dy then
+      distance <- dx + dy / 2
+    else
+      distance <- dy + dx / 2
+    end if
+
+    ._step_count <- distance / piece_actor::speed
+    if ._step_count < 1
+    do ._step_count <- 1
+  end func
+
+  # ---------------------------------------------------------------------------
+  hook think()
+    if ._step_count = 0
+    do return
+
+    ._step <- ._step + 1
+
+    if ._step >= ._step_count then
+      .x <- ._to_x
+      .y <- ._to_y
+      ._step_count <- 0
+
+      chess_sprites::_moving_actor <- null
+      return
+    end if
+
+    .x <- ._from_x + (._to_x - ._from_x) * ._step / ._step_count
+    .y <- ._from_y + (._to_y - ._from_y) * ._step / ._step_count
+    chess_sprites::_sort_by_depth()
+  end hook
+end class
+
+module chess_sprites
+  const anchor_x is -32 / 2
+  const anchor_y is -48 + 7
+
+  var _actors: piece_actor[size 64]
+
+  var _moving_actor: piece_actor
+
+  # ---------------------------------------------------------------------------
+  func init()
+    chess_sprites::_actors <- new piece_actor[size 64]()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Creates, moves, and removes piece sprites so they match the position.
+  func sync(position: chess_position)
+    var actors: piece_actor[size 64]
+    actors <- chess_sprites::_actors
+
+    var index: int, col: int, row: int
+    var piece: piece, actor: piece_actor
+
+    index <- 0
+    loop
+      if index >= 64
+      do drop
+
+      piece <- position.board[index]
+      actor <- actors[index]
+
+      if piece = piece_kind::none then
+        if actor <> null then
+          engine::remove_actor(actor)
+          actors[index] <- null
+        end if
+      else
+        if actor = null then
+          actor <- new piece_actor()
+          actors[index] <- actor
+          engine::add_actor_behind(actor)
+        end if
+
+        gameboard::get_col_row(to_byte(index), out col, out row)
+
+        actor.x <- gameboard::get_square_center_x(col, row)
+        | + chess_sprites::anchor_x
+
+        actor.y <- gameboard::get_square_center_y(row)
+        | + chess_sprites::anchor_y
+
+        if piece >= color::black then
+          actor.clip <- id_clip::piece_black
+        else
+          actor.clip <- id_clip::piece_white
+        end if
+
+        actor.freeze_clip_frame(piece::get_kind(piece))
+      end if
+
+      index <- index + 1
+    end loop
+
+    chess_sprites::_sort_by_depth()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Rebuilds the draw order.  Nearer pieces have a larger screen y and must
+  # come first, and squares 0..63 run a1..h8, which is exactly front to back.
+  # So re-adding each actor as the array walk reaches it is already the sort.
+  # Only the sliding piece, whose y no longer matches its square, is placed by
+  # comparison: it goes in just before the first actor that is farther away.
+  func _sort_by_depth()
+    var actors: piece_actor[size 64]
+    actors <- chess_sprites::_actors
+
+    var mover: piece_actor
+    mover <- chess_sprites::_moving_actor
+    if mover <> null
+    do engine::remove_actor(mover)
+
+    var inserted: bool
+    inserted <- mover = null
+
+    var index: int, actor: piece_actor
+    index <- 0
+    loop
+      if index >= 64
+      do drop
+
+      actor <- actors[index]
+
+      if actor <> null and actor <> mover then
+        engine::remove_actor(actor)
+
+        if not inserted and mover.y > actor.y then
+          engine::add_actor_behind(mover)
+          inserted <- true
+        end if
+
+        engine::add_actor_behind(actor)
+      end if
+
+      index <- index + 1
+    end loop
+
+    # The mover is behind every piece, or there were no others
+    if not inserted
+    do engine::add_actor_behind(mover)
+  end func
+
+  # ---------------------------------------------------------------------------
+  func animate_move(from: square, to: square)
+    var actor: piece_actor
+    actor <- chess_sprites::_actors[from]
+
+    if actor = null
+    do return
+
+    chess_sprites::_moving_actor <- actor
+
+    var col: int, row: int
+    gameboard::get_col_row(to, out col, out row)
+
+    actor.animate_to(
+    | gameboard::get_square_center_x(col, row) + chess_sprites::anchor_x,
+    | gameboard::get_square_center_y(row) + chess_sprites::anchor_y)
+  end func
+
+  func is_animating(): bool
+    return chess_sprites::_moving_actor <> null
+  end func
+end module

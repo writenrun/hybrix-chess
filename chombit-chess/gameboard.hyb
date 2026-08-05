@@ -1,0 +1,535 @@
+# A 3D-perspective chess board on the 320 x 224 screen: a trapezoid centered on
+# x_center, defined by its top edge (y_top, width_top) and bottom edge
+# (y_bottom, width_bottom).  Two rules define the projection:
+#
+#   1. Board width is linear in screen y, so the side edges are straight.
+#   2. 1 / width is linear in depth across the board.
+#
+# _init_square_tops() and _init_square_lefts() turn those into tables of rank
+# and file positions at startup, so the drawing loops and the hit test do no
+# perspective division.
+module gameboard
+  const y_top is 50          # screen y of the back rank line
+  const y_bottom is 214      # screen y of the front rank line
+
+  const width_top is 230     # board width at the back rank line
+  const width_bottom is 313  # board width at the front rank line
+
+  const x_center is 159      # the board is centered on this x
+
+  const edge_height is 5     # rows of the extruded front edge below y_bottom
+
+  # Colors: system palette indexes
+  const color_light_a is 10  # light squares, dither color 1 (10=crumpet)
+  const color_light_b is 5   # light squares, dither color 2 (5=pigeon)
+  const color_dark_a is 4    # dark squares, solid fill (4=tinman)
+  const color_dark_b is 4
+  const color_grid is 3      # 1px grid lines and board edge (3=frypan)
+  const color_background is 21  # surrounding the board (21=blue)
+  const color_mark_a is 15
+  const color_mark_b is 15
+  const color_glow_a is 14
+  const color_glow_b is 14
+
+  const screen_tile_cols is 20  # 320 / 16
+
+  # The board is drawn into a linear frame buffer (the "raster") of 320-byte
+  # rows, which _init_raster() maps into tileset B using tile_pitch.
+  var _raster_pixels: byte[]
+  var _raster_address: int  # to_address(_raster_pixels) + 3
+  var _raster_top: int      # screen y of raster row 0 (multiple of 16)
+  var _raster_height: int
+
+  # 32 x 16 tile code grid.  Module var so the GC keeps it alive while
+  # Palix holds its raw address.
+  var _tile_codes: pair[size 512]
+
+  var _square_tops: int[size 9]  # screen y of the 9 rank lines
+
+  # Screen x of the 9 file lines per row: _square_lefts[(y - y_top) * 9 + j],
+  # for y_top <= y <= y_bottom
+  var _square_lefts: int[]
+
+  # ---------------------------------------------------------------------------
+  func init()
+    gameboard::_init_raster()
+    gameboard::_init_square_tops()
+    gameboard::_init_square_lefts()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Allocates the raster and points tileset B at it, one tileset entry per
+  # 16 x 16 cell the board covers.
+  func _init_raster()
+    # Take ownership of tilemap B, so engine::render() leaves it alone
+    engine::tile_layer_b.load_tilemap(null)
+    engine::tile_layer_b.load_tileset(null)
+
+    var first_tile_row: int, last_tile_row: int
+    first_tile_row <- gameboard::y_top // 16
+    last_tile_row <- (gameboard::y_bottom + gameboard::edge_height + 1) // 16
+
+    var raster_height: int
+    raster_height <- (last_tile_row - first_tile_row + 1) * 16
+
+    gameboard::_raster_top <- first_tile_row * 16
+    gameboard::_raster_height <- raster_height
+
+    var raster_pixels: byte[]
+    raster_pixels <- new byte[](raster_height * 320)
+    gameboard::_raster_pixels <- raster_pixels
+
+    var raster_address: int
+    raster_address <- to_address(raster_pixels) + 3  # +3 skips the size field
+    gameboard::_raster_address <- raster_address
+
+    var tile_codes: pair[size 512]
+    tile_codes <- new pair[size 512]()
+    gameboard::_tile_codes <- tile_codes
+
+    # Each covered cell: tileset entry -> its upper-left byte in the raster;
+    # tile code = its tile index (bits 0..9), theme 0, no matte.  Cells
+    # outside the board keep code 0, whose tileset address 0 is transparent.
+    var tile_row: int, tile_col: int, tile_index: int
+    tile_row <- 0
+    loop
+      if tile_row > last_tile_row - first_tile_row
+      do drop
+
+      tile_col <- 0
+      loop
+        if tile_col >= gameboard::screen_tile_cols
+        do drop
+
+        tile_index <- 1 + tile_row * gameboard::screen_tile_cols + tile_col
+
+        io::tileset_b_addresses[tile_index] <-
+        | raster_address + tile_row * 16 * 320 + tile_col * 16
+
+        tile_codes[(tile_row + first_tile_row) * 32 + tile_col] <-
+        | to_pair(tile_index)
+
+        tile_col <- tile_col + 1
+      end loop
+
+      tile_row <- tile_row + 1
+    end loop
+
+    io::tilemap_b.x <- 0
+    io::tilemap_b.y <- 0
+    io::tilemap_b.col_count <- 32
+    io::tilemap_b.row_count <- 16
+    # No +3: _tile_codes is static (no size field), so to_address is elem 0.
+    io::tilemap_b.tile_codes_address <- to_address(tile_codes)
+    io::tilemap_b.edge_mode <- 1     # clip
+    io::tilemap_b.jumbo <- 1
+    io::tilemap_b.tile_pitch <- 320  # tile rows are raster rows
+
+    io::background_color <- gameboard::color_background
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Screen y of the 9 rank lines.  Rule 2 gives the board width at rank line i:
+  #     w[i] = 8 * width_top * width_bottom
+  #            / ((8 - i) * width_bottom + i * width_top)
+  # and inverting rule 1 turns that width back into a screen y.  Factored below
+  # so each entry is a single division, rounded by + d // 2.
+  func _init_square_tops()
+    var square_tops: int[size 9]
+    square_tops <- new int[size 9]()
+    gameboard::_square_tops <- square_tops
+
+    var i: int, den: int, num: int, d: int
+    i <- 0
+    loop
+      if i > 8
+      do drop
+
+      den <- (8 - i) * gameboard::width_bottom + i * gameboard::width_top
+      num <- (8 * gameboard::width_top * gameboard::width_bottom
+      |    - gameboard::width_top * den)
+      |    * (gameboard::y_bottom - gameboard::y_top)
+
+      d <- den * (gameboard::width_bottom - gameboard::width_top)
+
+      square_tops[i] <- gameboard::y_top + (num + d // 2) // d
+
+      i <- i + 1
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Screen x of the 9 file lines for each row y_top .. y_bottom.  File line j
+  # at row y is x_center + (j - 4) * w / 8, so with k = |j - 4| the offset is
+  #     q      = (k * w_num + d // 2) // d
+  #     w_num  = width_top * (y_bottom - y_top)              # = w scaled
+  #              + (y - y_top) * (width_bottom - width_top)  #   by yb - yt
+  #     d      = 8 * (y_bottom - y_top)
+  # Rounding the exact numerator once (rather than truncating w first) keeps
+  # the file lines straight; mirroring k keeps every row symmetric about
+  # x_center, and ties round away from the center.  Largest intermediate is
+  # ~25M, within int.
+  func _init_square_lefts()
+    var rows: int
+    rows <- gameboard::y_bottom - gameboard::y_top + 1
+
+    var square_lefts: int[]
+    square_lefts <- new int[](rows * 9)
+    gameboard::_square_lefts <- square_lefts
+
+    var d: int, half_d: int, slope: int
+    d <- 8 * (gameboard::y_bottom - gameboard::y_top)
+    half_d <- d // 2
+    slope <- gameboard::width_bottom - gameboard::width_top
+
+    var r: int, k: int, i: int, w_num: int, q: int
+    r <- 0
+    i <- 4  # index of the center file line for the current row
+    loop
+      if r >= rows
+      do drop
+
+      w_num <- gameboard::width_top * (gameboard::y_bottom - gameboard::y_top)
+      | + r * slope
+
+      k <- 0
+      loop
+        if k > 4
+        do drop
+
+        q <- (k * w_num + half_d) // d
+
+        square_lefts[i - k] <- gameboard::x_center - q
+        square_lefts[i + k] <- gameboard::x_center + q
+
+        k <- k + 1
+      end loop
+
+      i <- i + 9
+      r <- r + 1
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Drawn from White's side: col 0..7 is file a..h left to right, and row
+  # 0..7 runs back to front, so row 0 is rank 8.  Squares are a1 = 0 .. h8.
+  func get_square(col: int, row: int): square
+    return to_byte((7 - row) * 8 + col)
+  end func
+
+  func get_col_row(sq: square, out col: int, out row: int)
+    col <- sq % 8
+    row <- 7 - sq / 8
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Writes one pixel, ignoring coordinates outside the raster.  For runs,
+  # _fill_dither is much faster.
+  func _set_pixel(x: int, y: int, color: byte)
+    if x < 0 or x >= 320
+    do return
+
+    var row: int
+    row <- y - gameboard::_raster_top
+    if row < 0 or row >= gameboard::_raster_height
+    do return
+
+    unsafe(gameboard::_raster_pixels)[row * 320 + x] <- color
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Fills row y, pixels x_first..x_last inclusive, with the checker dither:
+  # color_a where x+y is odd, color_b where even.  The range is clamped to the
+  # raster, so a bad caller cannot corrupt memory through the kernel call.
+  func _fill_dither(y: int, x_first: int, x_last: int,
+  | color_a: byte, color_b: byte)
+    var row: int
+    row <- y - gameboard::_raster_top
+    if row < 0 or row >= gameboard::_raster_height
+    do return
+
+    if x_first < 0
+    do x_first <- 0
+
+    if x_last >= 320
+    do x_last <- 319
+
+    var count: int
+    count <- x_last - x_first + 1
+    if count <= 0
+    do return
+
+    var first: byte, second: byte
+    if math::bit_and(x_first + y, 1) = 1 then
+      first <- color_a
+      second <- color_b
+    else
+      first <- color_b
+      second <- color_a
+    end if
+
+    var offset: int
+    offset <- row * 320
+
+    if count = 1 then
+      unsafe(gameboard::_raster_pixels)[offset + x_first] <- first
+      return
+    end if
+
+    kernel::set_memory_pairs(gameboard::_raster_address + offset + x_first,
+    | to_pair(first * 256 + second), count // 2)
+
+    # Odd count leaves a trailing pixel, same parity as "first"
+    if math::bit_and(count, 1) = 1
+    do unsafe(gameboard::_raster_pixels)[offset + x_last] <- first
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Fills one square's interior, leaving the grid lines intact, so this is
+  # safe to call over a drawn board to highlight a move.
+  func fill_square(col: int, row: int, color_a: byte, color_b: byte)
+    # row is bounds-checked by _square_tops; a bad col would alias another row
+    if col < 0 or col > 7
+    do kernel::fail_code(20) # function was called with an invalid argument
+
+    var tops: int[size 9], lefts: int[]
+    tops <- gameboard::_square_tops
+    lefts <- gameboard::_square_lefts
+
+    var y: int, y_stop: int, row_start: int
+    y <- tops[row] + 1
+    y_stop <- tops[row + 1] - 1
+
+    loop
+      if y > y_stop
+      do drop
+
+      row_start <- (y - gameboard::y_top) * 9
+
+      gameboard::_fill_dither(y, lefts[row_start + col] + 1,
+      | lefts[row_start + col + 1] - 1, color_a, color_b)
+
+      y <- y + 1
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Repaints one square the way the empty board looks there.
+  func draw_square(col: int, row: int)
+    if math::bit_and(col + row, 1) = 0 then
+      gameboard::fill_square(col, row,
+      | gameboard::color_light_a, gameboard::color_light_b)
+    else
+      gameboard::fill_square(col, row,
+      | gameboard::color_dark_a, gameboard::color_dark_b)
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func draw_board()
+    # col 0, row 0 is the light square in the rear/left
+    var col: int, row: int
+    row <- 0
+    loop
+      if row > 7
+      do drop
+
+      col <- 0
+      loop
+        if col > 7
+        do drop
+
+        gameboard::draw_square(col, row)
+
+        col <- col + 1
+      end loop
+
+      row <- row + 1
+    end loop
+
+    gameboard::_draw_grid()
+    gameboard::_draw_edge()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The 9 rank lines and 9 file lines.  A rank line is one horizontal run; a
+  # file line shifts with y, so it is plotted one pixel per row.
+  func _draw_grid()
+    var tops: int[size 9], lefts: int[]
+    tops <- gameboard::_square_tops
+    lefts <- gameboard::_square_lefts
+
+    var row_start: int, y: int, j: int
+
+    j <- 0
+    loop
+      if j > 8
+      do drop
+
+      y <- tops[j]
+      row_start <- (y - gameboard::y_top) * 9
+
+      gameboard::_fill_dither(y, lefts[row_start], lefts[row_start + 8],
+      | gameboard::color_grid, gameboard::color_grid)
+
+      j <- j + 1
+    end loop
+
+    var pixels: byte[], raster_top: int, x: int, row_offset: int
+    pixels <- gameboard::_raster_pixels
+    raster_top <- gameboard::_raster_top
+
+    y <- tops[0]
+    loop
+      if y > tops[8]
+      do drop
+
+      row_start <- (y - gameboard::y_top) * 9
+      row_offset <- (y - raster_top) * 320
+
+      j <- 0
+      loop
+        if j > 8
+        do drop
+
+        x <- lefts[row_start + j]
+        if x >= 0 and x < 320
+        do pixels[row_offset + x] <- gameboard::color_grid
+
+        j <- j + 1
+      end loop
+
+      y <- y + 1
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The extruded front edge: bands below the front rank line, closed by a
+  # dark line.  Each band continues the checker as if a ninth row existed.  A
+  # vertical face keeps y_bottom's depth, so its projected width is constant
+  # and every row can use y_bottom's x, flush with the corners.
+  func _draw_edge()
+    var lefts: int[]
+    lefts <- gameboard::_square_lefts
+
+    var y_last: int, row_start: int
+    y_last <- gameboard::y_bottom + gameboard::edge_height
+    row_start <- (gameboard::y_bottom - gameboard::y_top) * 9
+
+    var col: int, y: int, x_first: int, x_last: int
+    var color_a: byte, color_b: byte
+    col <- 0
+    loop
+      if col > 7
+      do drop
+
+      x_first <- lefts[row_start + col] + 1
+      x_last <- lefts[row_start + col + 1] - 1
+
+      if math::bit_and(col, 1) = 0 then
+        color_a <- gameboard::color_light_a
+        color_b <- gameboard::color_light_b
+      else
+        color_a <- gameboard::color_dark_a
+        color_b <- gameboard::color_dark_b
+      end if
+
+      y <- gameboard::y_bottom + 1
+      loop
+        if y > y_last
+        do drop
+
+        gameboard::_fill_dither(y, x_first, x_last, color_a, color_b)
+
+        y <- y + 1
+      end loop
+
+      col <- col + 1
+    end loop
+
+    var j: int, x: int
+    j <- 0
+    loop
+      if j > 8
+      do drop
+
+      x <- lefts[row_start + j]
+
+      y <- gameboard::y_bottom + 1
+      loop
+        if y > y_last
+        do drop
+
+        gameboard::_set_pixel(x, y, gameboard::color_grid)
+
+        y <- y + 1
+      end loop
+
+      j <- j + 1
+    end loop
+
+    gameboard::_fill_dither(y_last + 1, lefts[row_start], lefts[row_start + 8],
+    | gameboard::color_grid, gameboard::color_grid)
+  end func
+
+  # ---------------------------------------------------------------------------
+  # A square's visual center, for positioning piece sprites:
+  #   sprite.x = get_square_center_x(col, row) - sprite_width / 2
+  #   sprite.y = get_square_center_y(row) - base_anchor_y
+  func get_square_center_x(col: int, row: int): int
+    # row is bounds-checked by _square_tops; a bad col would alias another row
+    if col < 0 or col > 7
+    do kernel::fail_code(20) # function was called with an invalid argument
+
+    var lefts: int[], row_start: int
+    lefts <- gameboard::_square_lefts
+    row_start <- (gameboard::get_square_center_y(row) - gameboard::y_top) * 9
+
+    return (lefts[row_start + col] + lefts[row_start + col + 1]) // 2
+  end func
+
+  func get_square_center_y(row: int): int
+    var tops: int[size 9]
+    tops <- gameboard::_square_tops
+
+    return (tops[row] + tops[row + 1]) // 2
+  end func
+
+  # ---------------------------------------------------------------------------
+  # A rank or file line counts as part of the square below or to the right of
+  # it.  The extruded front edge belongs to no square.
+  func try_get_col_row(x: int, y: int, out col: int, out row: int): bool
+    var tops: int[size 9], lefts: int[]
+    tops <- gameboard::_square_tops
+    lefts <- gameboard::_square_lefts
+
+    # tops[0] is exactly y_top and [8] exactly y_bottom, so this also keeps
+    # the _square_lefts row in range below
+    if y < tops[0] or y >= tops[8]
+    do return false
+
+    var row_start: int
+    row_start <- (y - gameboard::y_top) * 9
+
+    if x < lefts[row_start] or x >= lefts[row_start + 8]
+    do return false
+
+    # The calling convention started the outputs at 0, where these scans need
+    # to begin; the tests above bound both loops.
+    loop
+      if y < tops[row + 1]
+      do drop
+
+      row <- row + 1
+    end loop
+
+    loop
+      if x < lefts[row_start + col + 1]
+      do drop
+
+      col <- col + 1
+    end loop
+
+    return true
+  end func
+end module

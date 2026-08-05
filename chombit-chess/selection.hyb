@@ -1,0 +1,190 @@
+# The two interactive states of the game.  main owns the state machine and
+# calls one of these once per frame.
+module selection
+  # The piece being moved, or square::none while none is chosen.
+  view var start_square: square
+
+  # The square currently marked under the wand's point, or square::none.
+  view var hover: square
+
+  # The engine's legal targets for start_square, and the square each one is
+  # displayed and clicked at.  These differ only for castling: the engine
+  # speaks the king-two-step convention (e1g1), but the gesture we show is the
+  # king onto its own rook, which stays unambiguous even in fairy setups.
+  var _targets: square[size 64]
+  var _marks: square[size 64]
+  var _count: int
+
+  # ---------------------------------------------------------------------------
+  func init()
+    selection::_targets <- new square[size 64]()
+    selection::_marks <- new square[size 64]()
+    selection::forget()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Forgets the selection without drawing, for callers repainting anyway.
+  func forget()
+    selection::start_square <- square::none
+    selection::hover <- square::none
+    selection::_count <- 0
+  end func
+
+  # ---------------------------------------------------------------------------
+  func cancel()
+    gameboard::draw_board()
+    selection::forget()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Moves the hover mark onto sq, or clears it for square::none.  The square
+  # being left goes back to its glow mark while a target is being chosen.
+  func _move_hover(sq: square, restore_glow: bool)
+    if sq = selection::hover
+    do return
+
+    var col: int, row: int
+
+    if selection::hover <> square::none then
+      gameboard::get_col_row(selection::hover, out col, out row)
+      if restore_glow then
+        gameboard::fill_square(col, row,
+        | gameboard::color_glow_a, gameboard::color_glow_b)
+      else
+        gameboard::draw_square(col, row)
+      end if
+    end if
+
+    selection::hover <- sq
+
+    if sq <> square::none then
+      gameboard::get_col_row(sq, out col, out row)
+      gameboard::fill_square(col, row,
+      | gameboard::color_mark_a, gameboard::color_mark_b)
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The index of the displayed mark on sq, or -1.
+  func _find_mark(sq: square): int
+    var marks: square[size 64]
+    marks <- selection::_marks
+
+    var i: int
+    i <- 0
+    loop
+      if i >= selection::_count
+      do drop
+
+      if marks[i] = sq
+      do return i
+
+      i <- i + 1
+    end loop
+
+    return -1
+  end func
+
+  # ---------------------------------------------------------------------------
+  # One frame of choosing which piece to move; true if the click was acted on.
+  func choose_piece(wand_square: square, click: bool): bool
+    var position: chess_position
+    position <- main::position
+
+    # Only a piece of the side to move can be picked up.
+    if wand_square <> square::none
+    | and not piece::belongs_to(position.board[wand_square],
+    |                           position.side_to_move)
+
+    do wand_square <- square::none
+
+    selection::_move_hover(wand_square, false)
+
+    if wand_square = square::none or not click
+    do return false
+
+    var count: int
+    count <- main::chess_engine.collect_moves(wand_square, selection::_targets)
+    selection::_count <- count
+
+    if count = 0 then
+      sound::play_track(id_sound::invalid, 0)
+      main::wand.start_clip_frame(0)
+      return false
+    end if
+
+    var col: int, row: int
+    gameboard::get_col_row(wand_square, out col, out row)
+    gameboard::fill_square(col, row,
+    | gameboard::color_mark_a, gameboard::color_mark_b)
+
+    # Mark each target where it is clicked: a castle on the rook
+    # (describe_move's aux_source), anything else on the engine's own target.
+    var targets: square[size 64], marks: square[size 64]
+    targets <- selection::_targets
+    marks <- selection::_marks
+
+    var kind: move_kind, mark: square
+    var lands_on: square, aux_source: square, aux_target: square
+    var i: int
+    i <- 0
+    loop
+      if i >= count
+      do drop
+
+      kind <- main::chess_engine.describe_move(wand_square, targets[i],
+      | out lands_on, out aux_source, out aux_target)
+
+      if kind = move_kind::castle then
+        mark <- aux_source
+      else
+        mark <- targets[i]
+      end if
+
+      marks[i] <- mark
+
+      gameboard::get_col_row(mark, out col, out row)
+      gameboard::fill_square(col, row,
+      | gameboard::color_glow_a, gameboard::color_glow_b)
+
+      i <- i + 1
+    end loop
+
+    # The chosen square keeps its mark until the board is repainted.
+    selection::start_square <- wand_square
+    selection::hover <- square::none
+
+    main::ui_state <- ui_state::selecting_target
+    return true
+  end func
+
+  # ---------------------------------------------------------------------------
+  # One frame of choosing where it goes; true if the click was acted on.
+  func choose_target(wand_square: square, click: bool): bool
+    # Only a displayed mark can be hovered or clicked.
+    var i: int
+    i <- selection::_find_mark(wand_square)
+    if i < 0
+    do wand_square <- square::none
+
+    selection::_move_hover(wand_square, true)
+
+    if not click
+    do return false
+
+    if wand_square = square::none then
+      # Cancel, so an unintended square cannot be moved to by accident.
+      selection::cancel()
+      main::ui_state <- ui_state::selecting_piece
+      return true
+    end if
+
+    # _targets holds the engine's target, which differs from the mark for a
+    # castle.  A human move discovers a promotion by retry.
+    main::commit_move(selection::start_square, selection::_targets[i],
+    | piece_kind::none)
+
+    selection::start_square <- square::none
+    return true
+  end func
+end module

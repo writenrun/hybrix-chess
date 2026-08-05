@@ -1,0 +1,675 @@
+# =============================================================================
+# CHOMBIT CHESS
+# =============================================================================
+
+type ui_state is int
+module ui_state
+  const selecting_piece is 1
+  const selecting_target is 2
+  const animating is 3
+
+  # The side to move is a robot and the pre-move pause is running.  The fields
+  # stay clickable, which in robot against robot is the only way to take over.
+  const robot_pause is 4
+
+  # find_move() is running.  The main loop is blocked inside the call, so this
+  # state is observed only by the hud and by the on_progress callback.
+  const thinking is 5
+end module
+
+# -----------------------------------------------------------------------------
+module main
+  # Search duration alone does not pace the game (at Easy the reply is nearly
+  # instant).  The longer figure is the interrupt window above, so it must
+  # outlast a trip from wherever the wand sits to a field.
+  const pause_after_human_ms is 500
+  const pause_between_robots_ms is 2000
+
+  # About 6 KB, allocated once so play never triggers a garbage collection.
+  const history_capacity is 1024
+
+  var wand: wand_actor
+
+  var ui_state: ui_state
+
+  view var chess_engine: chess_engine
+
+  # The engine creates its position once and never replaces it.
+  view var position: chess_position
+
+  var adjudicate_fifty_moves: bool
+
+  # A ring retaining the newest plies: hist_size counts every ply committed
+  # since the last load, hist_base is the oldest retained.
+  var hist_source: byte[]
+  var hist_target: byte[]
+  var hist_token: int[]
+  var hist_size: int
+  var hist_base: int
+
+  # Click latching: input is edge triggered, and after any action or change of
+  # UI state the button must be released before another action can fire.
+  var _button_down: bool
+  var _awaiting_release: bool
+
+  # A bar column clicked during an animation, executed once the slide
+  # completes; -1 when nothing is pending.  Later presses are consumed.
+  var _pending_col: int
+
+  # The robot's pre-move deadline (io::clock_ms based), and the remaining time
+  # saved while an open question suspends the pause.
+  var _robot_wait_until_ms: int
+  var _robot_wait_saved_ms: int
+
+  # Set when the player asks for the move now; the on_progress callback then
+  # returns false.
+  var _search_stop: bool
+
+  # Keeps the search callback's UI work down to once per video frame.
+  var _search_last_frame: pair
+
+  # ---------------------------------------------------------------------------
+  # The smallest positive number of plies undo must pop for a human to be on
+  # move afterwards, or 0 when undo is unavailable.
+  func get_undo_plies(): int
+    if not main::chess_engine.can_undo_move
+    do return 0
+
+    # In robot against robot there is no human to hand the position back to.
+    if hud::is_robot(color::white) and hud::is_robot(color::black)
+    do return 0
+
+    # Popping one ply hands the move to the last mover; if that side is a
+    # robot, one more pop reaches the current side to move.
+    var n: int
+    if hud::is_robot(color::get_opponent(main::position.side_to_move)) then
+      n <- 2
+    else
+      n <- 1
+    end if
+
+    # If only the robot's opening ply exists, popping it would leave the robot
+    # to move again with nothing left to pop, so offer nothing.
+    if main::hist_size - main::hist_base < n
+    do return 0
+
+    return n
+  end func
+
+  # ---------------------------------------------------------------------------
+  func record_ply(source: square, target: square)
+    var slot: int
+    slot <- main::hist_size %% main::history_capacity
+
+    main::hist_source[slot] <- source
+    main::hist_target[slot] <- target
+    main::hist_token[slot] <- main::chess_engine.last_undo_token
+
+    main::hist_size <- main::hist_size + 1
+    if main::hist_size - main::hist_base > main::history_capacity
+    do main::hist_base <- main::hist_size - main::history_capacity
+  end func
+
+  # ---------------------------------------------------------------------------
+  func refresh_verdict()
+    var status: game_status
+    status <- main::chess_engine.status
+
+    var v: int
+    v <- hud::verdict_playing
+
+    if status = game_status::white_won then
+      v <- hud::verdict_white_won
+    elsif status = game_status::black_won then
+      v <- hud::verdict_black_won
+    elsif status = game_status::draw then
+      v <- hud::verdict_stalemate
+    elsif main::adjudicate_fifty_moves
+    | and main::position.halfmove_clock >= 100 then
+      # The clock counts plies, so 100 is 50 full moves.
+      v <- hud::verdict_fifty
+    end if
+
+    hud::verdict <- v
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Shared by undo, new game, and the end of a slide.
+  func redraw_position()
+    chess_sprites::sync(main::position)
+    gameboard::draw_board()
+    selection::forget()
+    main::wand.set_side(main::position.side_to_move)
+    hud::dirty <- true
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Applies an endorsed move, records it, and starts the slide.  promo_hint is
+  # piece_kind::none for a human move and found_promo for a robot one; both
+  # promote to queen wherever legal, falling back to the hint where not.
+  func commit_move(source: square, target: square, promo_hint: piece_kind)
+    var eng: chess_engine
+    eng <- main::chess_engine
+
+    var ok: bool
+    if promo_hint = piece_kind::none then
+      ok <- eng.try_move(source, target, piece_kind::none)
+      if not ok then
+        # Refusal of promo=none means this is a promotion.
+        ok <- eng.try_move(source, target, piece_kind::queen)
+      end if
+    else
+      ok <- eng.try_move(source, target, piece_kind::queen)
+      if not ok then
+        ok <- eng.try_move(source, target, promo_hint)
+      end if
+    end if
+
+    if not ok
+    do kernel::fail("try_move() breaks the API contract")
+
+    main::record_ply(source, target)
+    main::refresh_verdict()
+
+    # last_captured includes an en passant victim, never on the target square.
+    if eng.last_captured <> piece_kind::none then
+      sound::play_track(id_sound::capture, 0)
+    else
+      sound::play_track(id_sound::move, 0)
+    end if
+
+    chess_sprites::animate_move(source, target)
+    main::ui_state <- ui_state::animating
+    main::_awaiting_release <- true
+    hud::dirty <- true
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Pops plies until a human is to move again.
+  func do_undo()
+    var n: int
+    n <- main::get_undo_plies()
+    if n = 0
+    do return
+
+    var eng: chess_engine
+    eng <- main::chess_engine
+
+    var slot: int
+    loop
+      if n = 0
+      do drop
+
+      main::hist_size <- main::hist_size - 1
+      slot <- main::hist_size %% main::history_capacity
+      eng.undo_move(main::hist_source[slot], main::hist_target[slot],
+      | main::hist_token[slot])
+
+      n <- n - 1
+    end loop
+
+    main::refresh_verdict()
+    main::redraw_position()
+
+    # A human is to move by construction, which cancels any pending robot turn.
+    main::ui_state <- ui_state::selecting_piece
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Restarts, preserving both side assignments and their difficulty levels.
+  func do_new_game()
+    main::chess_engine.load_new_game()
+    main::hist_size <- 0
+    main::hist_base <- 0
+    main::refresh_verdict()
+    main::redraw_position()
+
+    main::enter_turn(main::pause_after_human_ms)
+  end func
+
+  # ---------------------------------------------------------------------------
+  # pause_ms is the robot's pre-move delay when the side to move is a robot.
+  func enter_turn(pause_ms: int)
+    if hud::verdict <> hud::verdict_playing then
+      # The game is over: board moves are refused and no searches start.
+      main::ui_state <- ui_state::selecting_piece
+      return
+    end if
+
+    if hud::is_robot(main::position.side_to_move) then
+      main::ui_state <- ui_state::robot_pause
+      main::_robot_wait_until_ms <- io::clock_ms + pause_ms
+    else
+      main::ui_state <- ui_state::selecting_piece
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Called once per frame, from the main loop or the search callback, not both.
+  func poll_click(): bool
+    var pressed: bool, click: bool
+    pressed <- gamepad::button_a
+    click <- pressed and not main::_button_down and not main::_awaiting_release
+    if not pressed
+    do main::_awaiting_release <- false
+    main::_button_down <- pressed
+    return click
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Runs find_move() for the side to move and commits its proposal.  The call
+  # is synchronous; search_on_progress() keeps the UI alive inside it.
+  func apply_robot_move()
+    var eng: chess_engine
+    eng <- main::chess_engine
+
+    var level: byte
+    level <- hud::get_side_level(main::position.side_to_move)
+
+    main::ui_state <- ui_state::thinking
+    main::_search_stop <- false
+    main::_search_last_frame <- io::frame_counter
+
+    # An ESC pressed before the search cannot stop it as it starts.
+    loop
+      if console::read_key() = 0
+      do drop
+    end loop
+
+    hud::hover_zone <- hud::zone_none
+    hud::print_top_bar()
+    hud::dirty <- false
+
+    # find_move() takes an absolute end time, so pass clock + duration.
+    # node_budget 0 disables that limit (it exists for debugging, not play).
+    eng.find_move(io::clock_ms + hud::get_level_ms(level), 0,
+    | (main::search_on_progress))
+
+    if eng.found_source = square::none
+    do kernel::fail("find_move() breaks the API contract")
+
+    # Restore the ordinary pre-move bar before the slide freezes it, so the
+    # bar under the robot's animation matches the bar under a human's.
+    main::ui_state <- ui_state::robot_pause
+    hud::hover_zone <- hud::zone_none
+    hud::print_top_bar()
+    hud::dirty <- false
+
+    main::commit_move(eng.found_source, eng.found_target, eng.found_promo)
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Polled by the engine during a search.  Returning false stops the search,
+  # which then reports its best proposal within ~100 ms.
+  func search_on_progress(): bool
+    # Between video frames, hand the CPU straight back to the engine.
+    if io::frame_counter = main::_search_last_frame
+    do return not main::_search_stop
+
+    main::_search_last_frame <- io::frame_counter
+
+    # The framework engine; no actor think() hook touches the chess engine.
+    engine::think()
+
+    # A click anywhere on the bar means "Move now", and so does ESC.  ESC is
+    # ignored everywhere else, so declining a question has no keyboard path.
+    var click: bool
+    click <- main::poll_click()
+
+    var bar_col: int
+    bar_col <- main::wand.get_bar_col()
+
+    if click and bar_col >= 0 then
+      main::_search_stop <- true
+      main::_awaiting_release <- true
+    end if
+
+    var key: byte
+    loop
+      key <- console::read_key()
+      if key = 0
+      do drop
+
+      if key = $1b
+      do main::_search_stop <- true
+    end loop
+
+    var zone: int
+    zone <- hud::zone_none
+    if bar_col >= 0
+    do zone <- hud::get_zone_at_col(bar_col)
+
+    if zone <> hud::hover_zone then
+      hud::hover_zone <- zone
+      hud::dirty <- true
+    end if
+
+    if hud::dirty then
+      hud::print_top_bar()
+      hud::dirty <- false
+    end if
+
+    engine::render()
+
+    io::paint_mode <- 3 # Asynchronous paint
+
+    sound::think()
+
+    return not main::_search_stop
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Takes a side away from the machine.
+  func set_side_human(side: color)
+    if side = color::white then
+      hud::white_is_robot <- false
+    else
+      hud::black_is_robot <- false
+    end if
+
+    if main::ui_state = ui_state::robot_pause
+    | and main::position.side_to_move = side
+    do main::ui_state <- ui_state::selecting_piece
+  end func
+
+  # ---------------------------------------------------------------------------
+  func open_question(q: int)
+    # The board is inert during a question, so drop any live selection
+    if selection::start_square <> square::none
+    | or selection::hover <> square::none then
+      selection::cancel()
+      main::ui_state <- ui_state::selecting_piece
+    end if
+
+    # Suspend the robot's pause
+    if main::ui_state = ui_state::robot_pause then
+      main::_robot_wait_saved_ms <- main::_robot_wait_until_ms - io::clock_ms
+      if main::_robot_wait_saved_ms < 0
+      do main::_robot_wait_saved_ms <- 0
+    end if
+
+    hud::question <- q
+    hud::dirty <- true
+  end func
+
+  # ---------------------------------------------------------------------------
+  func close_question()
+    var was_about: bool
+    was_about <- hud::question = hud::question_about
+
+    hud::question <- hud::question_none
+
+    if main::ui_state = ui_state::robot_pause
+    do main::_robot_wait_until_ms <- io::clock_ms + main::_robot_wait_saved_ms
+
+    if was_about then
+      # The box covers rows the bar does not, so repaint the whole console.
+      hud::close_about()
+    else
+      hud::dirty <- true
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func answer_question(zone: int)
+    var q: int
+    q <- hud::question
+
+    # The box has no answer to aim at, so any click that reaches it closes it.
+    if q = hud::question_about then
+      main::close_question()
+      return
+    end if
+
+    if q = hud::question_restart then
+      main::close_question()
+      if zone = hud::zone_yes
+      do main::do_new_game()
+      return
+    end if
+
+    var level: int
+    level <- -1
+    if zone = hud::zone_easy then
+      level <- hud::level_easy
+    elsif zone = hud::zone_medium then
+      level <- hud::level_medium
+    elsif zone = hud::zone_hard then
+      level <- hud::level_hard
+    end if
+
+    main::close_question()
+    if level < 0
+    do return
+
+    var side: color
+    if q = hud::question_robot_white then
+      side <- color::white
+      hud::white_is_robot <- true
+      hud::white_level <- to_byte(level)
+    else
+      side <- color::black
+      hud::black_is_robot <- true
+      hud::black_level <- to_byte(level)
+    end if
+
+    if hud::verdict = hud::verdict_playing
+    | and main::position.side_to_move = side then
+      main::ui_state <- ui_state::robot_pause
+      main::_robot_wait_until_ms <- io::clock_ms
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Returns true if the click was consumed.  Inert bar content falls through
+  # to the board logic, where an off-board click cancels a selection.
+  func handle_bar_click(col: int): bool
+    var zone: int
+    zone <- hud::get_zone_at_col(col)
+
+    if hud::question <> hud::question_none then
+      main::answer_question(zone)
+      main::_awaiting_release <- true
+      return true
+    end if
+
+    if zone = hud::zone_none
+    do return false
+
+    if zone = hud::zone_white then
+      if hud::white_is_robot then
+        main::set_side_human(color::white)
+      else
+        main::open_question(hud::question_robot_white)
+      end if
+    elsif zone = hud::zone_black then
+      if hud::black_is_robot then
+        main::set_side_human(color::black)
+      else
+        main::open_question(hud::question_robot_black)
+      end if
+    elsif zone = hud::zone_about then
+      main::open_question(hud::question_about)
+    elsif zone = hud::zone_undo then
+      main::do_undo()
+    elsif zone = hud::zone_new then
+      main::open_question(hud::question_restart)
+    end if
+
+    main::_awaiting_release <- true
+    hud::dirty <- true
+    return true
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The slide has landed: show the new position and start the next turn.
+  func finish_animation()
+    # draw_board() can be slow, so painting the last frame immediately
+    engine::render()
+    engine::wait_for_paint()
+
+    main::redraw_position()
+
+    # The sting waits for the slide so it does not collide with the move that
+    # earned it.  A draw gets no track.
+    if hud::verdict = hud::verdict_white_won
+    | or hud::verdict = hud::verdict_black_won
+    do sound::play_track(id_sound::win, 0)
+
+    var pause_ms: int
+    if hud::is_robot(color::get_opponent(main::position.side_to_move)) then
+      pause_ms <- main::pause_between_robots_ms
+    else
+      pause_ms <- main::pause_after_human_ms
+    end if
+
+    main::enter_turn(pause_ms)
+
+    # A column was recorded, not an action, so it resolves against the state
+    # the animation landed in.
+    if main::_pending_col >= 0 then
+      var pending: int
+      pending <- main::_pending_col
+      main::_pending_col <- -1
+      main::handle_bar_click(pending)
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func setup()
+    main::hist_source <- new byte[](main::history_capacity)
+    main::hist_target <- new byte[](main::history_capacity)
+    main::hist_token <- new int[](main::history_capacity)
+    main::_pending_col <- -1
+
+    engine::init()
+    sound::init()
+
+    #if symbols::scenes <> null and symbols::scenes.size > 0
+    #do symbols::scenes[0].load()
+
+    var wand_actor: wand_actor
+    wand_actor <- new wand_actor()
+    wand_actor.clip <- id_clip::wand_white
+    wand_actor.x <- 280
+    wand_actor.y <- 40
+    engine::add_actor(wand_actor)
+
+    console::init(io::tilemap_a)
+    if art::fonts.size > 0
+    do engine::tile_layer_a.load_tileset(art::fonts[0])
+
+    io::paint_mode <- 1 # Unbuffered paint
+
+    engine::render()
+
+    # ---- Engine instantiation site --------------------------------------
+    #main::chess_engine <- new reference_chess_engine()
+    main::chess_engine <- new micromax_chess_engine()
+
+    main::adjudicate_fifty_moves <- true
+    hud::neutral_verdicts <- false
+    # ---------------------------------------------------------------------
+
+    if not main::chess_engine.can_collect_moves
+    do kernel::fail("engine lacks collect_moves")
+
+    main::chess_engine.load_new_game()
+    main::position <- main::chess_engine.position
+
+    hud::init()
+
+    hud::black_is_robot <- main::chess_engine.can_find_move
+
+    gameboard::init()
+    gameboard::draw_board()
+
+    selection::init()
+    chess_sprites::init()
+    chess_sprites::sync(main::position)
+
+    main::ui_state <- ui_state::selecting_piece
+  end func
+
+  # ---------------------------------------------------------------------------
+  func start()
+    main::setup()
+
+    loop
+      engine::think()
+
+      var click: bool
+      click <- main::poll_click()
+
+      var wand: wand_actor
+      wand <- main::wand
+
+      var bar_col: int
+      bar_col <- wand.get_bar_col()
+
+      if main::ui_state <> ui_state::animating then
+        var zone: int
+        zone <- hud::zone_none
+        if bar_col >= 0
+        do zone <- hud::get_zone_at_col(bar_col)
+
+        if zone <> hud::hover_zone then
+          hud::hover_zone <- zone
+          hud::dirty <- true
+        end if
+      end if
+
+      if hud::question <> hud::question_none then
+        if click then
+          if bar_col >= 0 then
+            main::handle_bar_click(bar_col)
+          else
+            main::close_question()
+            main::_awaiting_release <- true
+          end if
+        end if
+
+      elsif main::ui_state = ui_state::animating then
+        if click and bar_col >= 0 and main::_pending_col < 0
+        do main::_pending_col <- bar_col
+
+        if not chess_sprites::is_animating()
+        do main::finish_animation()
+
+      else
+        # A consumed bar click skips the rest of this frame: it may have
+        # changed state, and the board logic must not run against that.
+        var consumed: bool
+        consumed <- false
+        if click and bar_col >= 0
+        do consumed <- main::handle_bar_click(bar_col)
+
+        if consumed then
+          click <- false
+
+        elsif main::ui_state = ui_state::robot_pause then
+          if main::_robot_wait_until_ms - io::clock_ms <= 0
+          do main::apply_robot_move()
+
+        elsif main::ui_state = ui_state::selecting_piece
+        | and hud::verdict = hud::verdict_playing then
+          if selection::choose_piece(wand.square, click)
+          do main::_awaiting_release <- true
+
+        elsif main::ui_state = ui_state::selecting_target then
+          if selection::choose_target(wand.square, click)
+          do main::_awaiting_release <- true
+        end if
+      end if
+
+      if hud::dirty and main::ui_state <> ui_state::animating then
+        hud::print_top_bar()
+        hud::dirty <- false
+      end if
+
+      engine::render()
+      engine::wait_for_paint()
+      sound::think()
+    end loop
+  end func
+end module

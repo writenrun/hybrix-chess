@@ -1,0 +1,103 @@
+class wand_actor extends actor
+  # Offset from .x/.y (the sprite's upper-left corner) to the arrow's point,
+  # the pixel that picks a square or a bar column.
+  const tip_x is 8
+  const tip_y is 8
+
+  const speed is 4  # pixels per frame
+
+  const screen_width is 320
+  const screen_height is 224
+
+  # Bounds for .x/.y that clamp the point rather than the sprite's corner,
+  # which is what makes column 0, column 39, and the outer files reachable.
+  const min_x is -wand_actor::tip_x
+  const max_x is wand_actor::screen_width - 1 - wand_actor::tip_x
+  const min_y is -wand_actor::tip_y
+  const max_y is wand_actor::screen_height - 1 - wand_actor::tip_y
+
+  # The square under the point
+  view var square: square
+
+  constructor()
+    base()
+    .layer <- 0  # appear in front of chess pieces
+
+    # Without this, square 0 would read as a hover over a1 before think()
+    .square <- square::none
+  end constructor
+
+  hook on_added()
+    main::wand <- self
+
+    .start_clip_frame(1)
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Points the arrow at the given side's color.
+  func set_side(side: color)
+    if side = color::white then
+      .clip <- id_clip::wand_white
+    else
+      .clip <- id_clip::wand_black
+    end if
+
+    .start_clip_frame(1)
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The console column (0..39) under the point while it is on the top bar,
+  # otherwise -1.  The bar is console row 0 and console cells are 8 x 8.
+  func get_bar_col(): int
+    var x: int, y: int
+    x <- .x + wand_actor::tip_x
+    y <- .y + wand_actor::tip_y
+
+    if y < 0 or y >= 8 or x < 0 or x >= 320
+    do return -1
+
+    return x / 8
+  end func
+
+  # ---------------------------------------------------------------------------
+  hook think()
+    var x: int, y: int
+    x <- .x
+    y <- .y
+
+    if gamepad::left
+    do x <- x - wand_actor::speed
+
+    if gamepad::right
+    do x <- x + wand_actor::speed
+
+    if gamepad::up
+    do y <- y - wand_actor::speed
+
+    if gamepad::down
+    do y <- y + wand_actor::speed
+
+    if x < wand_actor::min_x
+    do x <- wand_actor::min_x
+
+    if x > wand_actor::max_x
+    do x <- wand_actor::max_x
+
+    if y < wand_actor::min_y
+    do y <- wand_actor::min_y
+
+    if y > wand_actor::max_y
+    do y <- wand_actor::max_y
+
+    .x <- x
+    .y <- y
+
+    var col: int, row: int
+    if gameboard::try_get_col_row(x + wand_actor::tip_x, y + wand_actor::tip_y,
+    | out col, out row) then
+      .square <- gameboard::get_square(col, row)
+    else
+      .square <- square::none
+    end if
+  end hook
+end class

@@ -1,0 +1,48 @@
+# -----------------------------------------------------------------------------
+# This board symbol places an actor at a given spot when the scene is loaded.
+class s_actor_spot
+  var x: int
+  var y: int
+  var actor_factory: actor_factory
+  var starting_clip: clip
+  var starting_frame_index: byte
+  var theme: byte
+  var flip_x: bool, flip_y: bool, rotate: bool
+end class
+
+# -----------------------------------------------------------------------------
+# The "s_scene" board symbol specifies a tilemap and a collection of actors.
+class s_scene
+  var title: string
+  var tilemap: tilemap
+  var tileset: tileset
+  var actor_spots: s_actor_spot[]
+  var background_color: byte
+
+  # ---------------------------------------------------------------------------
+  func load()
+    var tileset: tileset
+    var tilemap: tilemap
+
+    tilemap <- .tilemap
+    tileset <- .tileset
+
+    # Free the memory from the old tilemap copy
+    engine::clear_actors()
+    engine::tile_layer_b.load_tilemap(null)
+
+    if tilemap <> null and tileset <> null then
+      var tilemap_copy: tilemap
+      tilemap_copy <- new tilemap()
+      tilemap_copy.copy_from(tilemap)
+      engine::tile_layer_b.load_tilemap(tilemap_copy)
+      engine::tile_layer_b.load_tileset(tileset)
+    end if
+
+    engine::load_actor_spots(.actor_spots)
+
+    if .background_color > 0 then
+      io::background_color <- .background_color
+    end if
+  end func
+end class
