@@ -1,0 +1,647 @@
+# =============================================================================
+# CHESS ENGINE API                                           VERSION 2026-08-01
+# =============================================================================
+
+# =============================================================================
+# ENUMS
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+type color is byte
+
+module color
+  const white is 0
+  const black is 16
+
+  # For white, returns black.  For black, returns white.
+  func get_opponent(side: color): color
+    return to_byte(color::black - side)
+  end func
+end module
+
+# -----------------------------------------------------------------------------
+type piece_kind is byte
+
+module piece_kind
+  const none is 0    # Used for an empty square
+
+  const pawn is 1
+  const knight is 2
+  const bishop is 3
+  const rook is 4
+  const queen is 5
+  const king is 6
+  # (7..15 are reserved for future fairy pieces)
+end module
+
+# -----------------------------------------------------------------------------
+# A contents of a board square: piece_kind in bits 0..3, color in bit 4.
+# For example, 3 + 16 = 19 for a black bishop.
+type piece is byte
+
+module piece
+  # True when the piece belongs to the given side.
+  func belongs_to(piece: piece, color: color): bool
+    return piece <> piece_kind::none and math::bit_and(piece, 16) = color
+  end func
+
+  func get_kind(piece: piece): piece_kind
+    return to_byte(math::bit_and(piece, 15))
+  end func
+end module
+
+# -----------------------------------------------------------------------------
+# A board square index encoded as 0..63 as rank * 8 + file, from White's side
+# of the board, where a1 = 0, h1 = 7, a8 = 56, h8 = 63.
+type square is byte
+
+module square
+  # The "no square" sentinel (en-passant state, found_source when no legal
+  # move exists).
+  const none is 255
+end module
+
+# -----------------------------------------------------------------------------
+# A bitmask used to track castling availability
+type castling is byte
+
+module castling
+  const white_king is 1    # White may still castle kingside
+  const white_queen is 2
+  const black_king is 4
+  const black_queen is 8
+
+  const all is 15
+end module
+
+# -----------------------------------------------------------------------------
+# Game status. The chess_engine subclasses are not responsible for detecting
+# repetition and 50-move draws, thus game_status::draw here means stalemate.
+type game_status is byte
+
+module game_status
+  const playing is 0
+  const white_won is 1
+  const black_won is 2
+  const draw is 3
+end module
+
+# -----------------------------------------------------------------------------
+# What describe_move() names a move as, for a front end that animates moves
+# or captions them; one that simply redraws the board can ignore it.
+type move_kind is byte
+
+module move_kind
+  const normal is 0        # one piece moves; a capture stood on the target
+  const castle is 1        # the king and one rook relocate together
+  const en_passant is 2    # captures a pawn that did not stand on the target
+  # (3..255 are reserved for future fairy chess concepts)
+end module
+
+# -----------------------------------------------------------------------------
+# find_move() accepts an optional callback allowing the front end to perform
+# realtime updates such as moving the mouse cursor.  If the callback returns
+# false, then the engine should abort its search (for example ESC was pressed).
+type find_on_progress is func(): bool
+
+# =============================================================================
+# CHESS POSITION
+# =============================================================================
+# A complete board state including Forsyth-Edwards Notation (FEN) scalars.
+# Can be used to implement save/load or to initialize chess puzzles.  If a
+# variant needs extra state, extend this class and override create_position().
+class chess_position
+  var board: piece[]
+  var side_to_move: color
+  var castling: castling
+
+  # FEN-style en-passant square: the square behind a pawn that has just made
+  # a double step (the square a capturing pawn would land on), or square::none.
+  # Recorded after every double step, whether or not an en-passant capture
+  # is actually possible.
+  var ep_square: square
+
+  # Number of plies since the last pawn move or capture (for the 50-move rule).
+  # A value of 255 indicates an unlikely "saturated" count that is >= 255;
+  # this simplifies serialization scenarios such as last_undo_token.
+  var halfmove_clock: byte
+
+  # Starts at 1, incremented after each Black move
+  var fullmove_number: int
+
+  # ---------------------------------------------------------------------------
+  constructor()
+    .board <- new piece[](64)
+    .side_to_move <- color::white
+    .castling <- 0
+    .ep_square <- square::none
+    .halfmove_clock <- 0
+    .fullmove_number <- 1
+  end constructor
+
+  # ---------------------------------------------------------------------------
+  # Copy another record into this one (e.g. .position -> undo history).
+  new hook copy_from(other: chess_position)
+    .board.copy_from(0, other.board, 0, 64)
+    .side_to_move <- other.side_to_move
+    .castling <- other.castling
+    .ep_square <- other.ep_square
+    .halfmove_clock <- other.halfmove_clock
+    .fullmove_number <- other.fullmove_number
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # This validates that member variables have valid values and are internally
+  # consistent, in other words catching problems that wouldn't be obvious
+  # from visually inspecting the board.  It also performs a few cheap sanity
+  # checks, but does not prove that the position resulted from legal play.
+  # Returns true if no problems were found.
+  new hook validate(): bool
+    # Side to move must be one of the two color codes.
+    if .side_to_move <> color::white and .side_to_move <> color::black
+    do return false
+
+    # The castling mask must contain no unknown bits.
+    if math::bit_and(.castling, 255 - castling::all) <> 0
+    do return false
+
+    # fullmove_number starts at 1, so 0 or a negative value is illegal.
+    if .fullmove_number < 1
+    do return false
+
+    # Scan the board: every square has a legal piece, exactly one king per
+    # side, no pawn on rank 1 or 8 (it would already have promoted).
+    var square: square, piece: piece, piece_kind: piece_kind
+    var white_kings: int, black_kings: int
+    white_kings <- 0
+    black_kings <- 0
+    square <- 0
+    loop
+      if square >= 64
+      do drop
+
+      piece <- .board[square]
+      if piece <> piece_kind::none then
+        if piece >= 32
+        do return false
+
+        piece_kind <- piece::get_kind(piece)
+        if piece_kind = piece_kind::none or piece_kind >= 7
+        do return false    # 7..15 are reserved, unassigned kinds
+
+        if piece_kind = piece_kind::pawn and (square < 8 or square >= 56)
+        do return false
+
+        if piece = (piece_kind::king + color::white) then
+          white_kings <- white_kings + 1
+        elsif piece = (piece_kind::king + color::black) then
+          black_kings <- black_kings + 1
+        end if
+      end if
+
+      square <- to_byte(square + 1)
+    end loop
+
+    if white_kings <> 1 or black_kings <> 1
+    do return false
+
+    # Each claimed castling right asserts that its king and rook still
+    # sit on their home squares: the mask makes a claim about the board,
+    # so the two must agree.
+    if math::bit_and(.castling, castling::white_king) <> 0
+    | and (.board[4] <> (piece_kind::king + color::white)
+    |      or .board[7] <> (piece_kind::rook + color::white))
+    do return false
+
+    if math::bit_and(.castling, castling::white_queen) <> 0
+    | and (.board[4] <> (piece_kind::king + color::white)
+    |      or .board[0] <> (piece_kind::rook + color::white))
+    do return false
+
+    if math::bit_and(.castling, castling::black_king) <> 0
+    | and (.board[60] <> (piece_kind::king + color::black)
+    |      or .board[63] <> (piece_kind::rook + color::black))
+    do return false
+
+    if math::bit_and(.castling, castling::black_queen) <> 0
+    | and (.board[60] <> (piece_kind::king + color::black)
+    |      or .board[56] <> (piece_kind::rook + color::black))
+    do return false
+
+    # En passant: ep_square names the square left behind by the
+    # immediately preceding double pawn step, so the board must show that
+    # step.  Black to move: the square is on rank 3 (squares 16..23), the
+    # white pawn sits one rank past it (ep + 8), and the square and the
+    # origin behind it (ep - 8) are empty.  White to move: mirrored on
+    # rank 6 (40..47), black pawn at ep - 8, empty origin at ep + 8.
+    # No capturing pawn needs to exist on an adjacent file, because
+    # ep_square is recorded after every double step.
+    if .ep_square <> square::none then
+      # The double step was a pawn move, so it reset the halfmove clock.
+      if .halfmove_clock <> 0
+      do return false
+
+      if .side_to_move = color::black then
+        if .ep_square < 16 or .ep_square >= 24
+        do return false
+
+        if .board[.ep_square] <> piece_kind::none
+        | or .board[.ep_square - 8] <> piece_kind::none
+        | or .board[.ep_square + 8] <> (piece_kind::pawn + color::white)
+        do return false
+      else
+        if .ep_square < 40 or .ep_square >= 48
+        do return false
+
+        if .board[.ep_square] <> piece_kind::none
+        | or .board[.ep_square + 8] <> piece_kind::none
+        | or .board[.ep_square - 8] <> (piece_kind::pawn + color::black)
+        do return false
+      end if
+    end if
+
+    return true
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Configures the standard board position for a new game.
+  new hook set_new_game()
+    .board.copy_from(0, chess_position::start_board, 0, 64)
+    .side_to_move <- color::white
+    .castling <- castling::all
+    .ep_square <- square::none
+    .halfmove_clock <- 0
+    .fullmove_number <- 1
+  end hook
+end class
+
+module chess_position
+  # The 64 squares of the standard starting position.
+  var start_board: piece[]
+end module
+
+data chess_position::start_board
+[
+   4,  2,  3,  5,  6,  3,  2,  4,
+   1,  1,  1,  1,  1,  1,  1,  1,
+   0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,
+  17, 17, 17, 17, 17, 17, 17, 17,
+  20, 18, 19, 21, 22, 19, 18, 20
+]
+end data
+
+# =============================================================================
+# PLUGIN BASE CLASS
+# =============================================================================
+# The API contract for plug-in chess implementations, for use by a front end
+# such as a graphical or text-based chess app, or a future tournament harness
+# where Hybrix virtual machines play against each other using the serial port.
+# The contract is separated into four orthogonal features; subclasses declare
+# which features they implement by setting flags such as can_load_position.
+#
+# The subclass reports the current state as a chess_position.  It is also
+# responsible for checking legality of moves, since subclasses often implement
+# slightly different chess rules.  For human-vs-human play, the
+# reference_chess_engine subclass provides an example implementation of
+# standard chess with a trivial search algorithm.
+class chess_engine
+  # ---------------------------------------------------------------------------
+  # Constants set by the constructor
+
+  # An implementation name that can be shown by the front end,
+  # for example "Micro-Max 3.2".  The string should not exceed 24 characters.
+  view var name: string
+
+  # If true, then the subclass supports load_position()
+  view var can_load_position: bool
+
+  # If true, then the subclass supports undo_move()
+  view var can_undo_move: bool
+
+  # If true, then the subclass supports collect_moves()
+  view var can_collect_moves: bool
+
+  # If true, then the subclass supports find_move()
+  view var can_find_move: bool
+
+  # ---------------------------------------------------------------------------
+  # Updated by actions that modify the board position
+
+  # (READ-ONLY) The engine updates this object; the front end should never
+  # modify it.  To simplify the initialization sequence, "position" is null
+  # until the first successful call to load_new_game() or load_position().
+  view var position: chess_position
+
+  # True when the side to move's king is attacked; lets a GUI announce
+  # "check", and distinguishes checkmate from stalemate for human play.
+  view var in_check: bool
+
+  # The piece captured by the last successful try_move(), or piece_kind::none.
+  # The piece may not have been in the target square (e.g. en passant).
+  # Cleared before every try_move() and reset by load and undo operations.
+  view var last_captured: piece
+
+  # Refreshed together with .position: playing while the side to move has
+  # a legal move; white_won / black_won when the side to move is
+  # checkmated; draw when stalemated.  Engines MUST keep this correct
+  # after every successful try_move().
+  # Repetition and 50-move draws are NOT reported here; see game_status docs.
+  view var status: game_status
+
+  # If can_undo_move=true, then try_move() also updates this with an
+  # engine-specific 32-bit integer for use by undo_move().
+  view var last_undo_token: int
+
+  # ---------------------------------------------------------------------------
+  # Outputs of find_move(), valid only until the next chess_engine call:
+
+  view var found_source: square
+  view var found_target: square
+  view var found_promo: piece_kind
+
+  # The found_stat_ outputs are diagnostic statistics that a GUI can display.
+  # If a statistic is blank or unimplemented, its value will be $8000_0000.
+  # The units are engine-specific and should be defined in a way that ensures
+  # their values will never exceed the 32-bit maximum of $7fff_ffff.
+
+  # The count of positions, nodes, or move candidates that were examined.
+  view var found_stat_nodes: int
+
+  # The search depth measured in engine-defined plies.  For iterative-deepening
+  # engines, this is usually the deepest completed iteration.
+  view var found_stat_depth: int
+
+  # Score for the proposed move from the mover's point of view, preferably in
+  # centipawn-like units: +100 is about one pawn better for the mover.
+  # Engines may keep their native scale when conversion would complicate a port.
+  view var found_stat_score: int
+
+  # ---------------------------------------------------------------------------
+  constructor()
+    .name <- "Untitled Engine"
+    .can_undo_move <- false
+    .can_load_position <- false
+    .can_collect_moves <- false
+    .can_find_move <- false
+  end constructor
+
+  # ---------------------------------------------------------------------------
+  # This is called by load_new_game() and load_position() before
+  # .on_load_new_game() or .on_load_position().  Subclasses can use this hook
+  # to perform common initialization.
+  new hook _on_prepare_load()
+    .in_check <- false
+    .status <- game_status::playing
+    .last_undo_token <- 0
+    .last_captured <- piece_kind::none
+
+    ._reset_find_outputs()
+  end hook
+
+  # ---------------------------------------------------------------------------
+  new hook create_position(): chess_position
+    return new chess_position()
+  end hook
+
+  # ---------------------------------------------------------------------------
+  func load_new_game()
+    ._on_prepare_load()
+
+    if .position = null
+    do .position <- .create_position()
+
+    .position.set_new_game()
+    .on_load_new_game()
+  end func
+
+  new hook on_load_new_game()
+    kernel::fail("on_load_new_game() not implemented")
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Optional: Fails unless the constructor set can_load_position=true.
+  # An alternative to load_new_game() that instead initializes the board with
+  # an arbitrary position.  Returns false for an invalid position.
+  # Although useful for load/save and chess puzzles,
+  # this is optional because the roundtrip often significantly complicates
+  # the subclass's implementation.
+  func load_position(position: chess_position): bool
+
+    # Assertion: Calling "engine.load_position(engine.position)" is almost
+    # certainly a bug because external code must not modify engine.position.
+    if position = .position
+    do kernel::fail("invalid position object")
+
+    # This validation is intentionally separated from on_load_position()
+    # so that chess_position validity is identical across chess_engine
+    # implementors; note that validate() is a hook that subclasses can change.
+    if not position.validate()
+    do return false
+
+    ._on_prepare_load()
+
+    if .position = null
+    do .position <- .create_position()
+
+    .position.copy_from(position)
+    .on_load_position()
+
+    return true
+  end func
+
+  new hook on_load_position()
+    kernel::fail("on_load_position() not implemented")
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Validate and apply one move for the current side_to_move. This is the one
+  # and only way that chess_position is updated during normal play.
+  #
+  # External move encoding:
+  # - Moves usually go from source to target, clarified by describe_move()
+  # - Castling: the king's two-square move from its home square
+  #   (e1g1, e1c1, e8g8, e8c8); the rook hop is implied.
+  # - En passant: the capturing pawn moves to .position.ep_square.
+  # - Promotion: a pawn moves to the last rank with promo = one of
+  #   piece_kind::knight, bishop, rook, or queen.  The "promo" parameter
+  #   must be piece_kind::none for non-promotion moves. A promotion with
+  #   any other promo value (including none) is rejected.
+  #
+  # On success, the subclass applies the move, flips side_to_move, updates
+  # the chess_position, refreshes the chess_engine members, and returns true.
+  # On failure, "false" is returned and nothing is updated.
+  func try_move(source: square, target: square, promo: piece_kind): bool
+    if .position = null
+    do kernel::fail("try_move() before the position was loaded")
+
+    if .status <> game_status::playing
+    do return false
+
+    if source >= 64 or target >= 64 or source = target
+    do return false
+
+    .last_captured <- piece_kind::none
+
+    return .on_try_move(source, target, promo)
+  end func
+
+  new hook on_try_move(source: square, target: square,
+  | promo: piece_kind): bool
+    kernel::fail("on_try_move() not implemented")
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Optional: Fails unless the constructor set can_undo_move=true.
+  # When try_move() returns true, it also updates last_undo_token with an
+  # engine-specific 32-bit value, so that move can be reversed by calling
+  # undo_move() with the exact same (source, target, last_undo_token).
+  # By saving these tuplets, the front end can undo an arbitrary history.
+  # Undo operations must adhere to last-in-first-out order, and tokens become
+  # invalid after load_new_game() or load_position().  undo_move() must restore
+  # every try_move() output, except last_undo_token should be reset to 0
+  # and last_captured should be reset to piece_kind::none.
+  #
+  # IMPORTANT: To keep the implementation simple, undo_move() is not required
+  # to validate its input, therefore callers must be extremely careful
+  # not to provide invalid inputs that might corrupt the board state.
+  # If a subclass does detect a mistake, it should kernel::fail()
+  # to facilitate debugging since these cases can be difficult to reproduce.
+  new hook undo_move(source: square, target: square, token: int)
+    kernel::fail("undo() not supported")
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Optional: Fails unless the constructor set can_collect_moves=true.
+  # Enumerates the legal moves for the "source" piece, writing them as
+  # elements in the provided "targets" array and returning the count.
+  # Returns 0 if the square is empty, holds an opponent piece, or the piece
+  # is pinned beyond moving.  A target is included if and only if
+  # try_move(source, target, promo) would accept it for some promo,
+  # therefore a front end can detect promotions by retrying: pass promo=none,
+  # and if that is rejected, retry with other pieces until one is accepted.
+  # A failed try_move() changes nothing.
+  new hook collect_moves(source: square, targets: square[size 64]): int
+    kernel::fail("chess_engine::collect_moves not implemented")
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Given a move that try_move() would accept, extract details that a front end
+  # can use for animation or captions.  Nothing is modified and no search runs.
+  # The default below covers orthodox rules; subclasses can extend it.
+  #
+  # - lands_on: where the moving piece ends up, or square::none if the move
+  #   removes it.  For fairy chess rules, it might differ from "target".
+  # - aux_source: the one other piece the move disturbs (the castling rook,
+  #   the en-passant victim), or square::none.  The front end can use it as a
+  #   friendlier click target, for example clicking on the rook to indicate
+  #   castling (while the engine still receives the king's target).
+  # - aux_target: where that piece lands; square::none removes it.
+  #
+  # These squares suggest animations, but are not guaranteed to fully
+  # describe the new position.
+  new hook describe_move(source: square, target: square,
+  | out lands_on: square, out aux_source: square,
+  | out aux_target: square): move_kind
+    lands_on <- target
+    aux_source <- square::none
+    aux_target <- square::none
+
+    var kind: piece_kind
+    kind <- piece::get_kind(.position.board[source])
+
+    # Castling: the king's only two square move.  The rook is the corner
+    # the king moved toward, landing on the square the king crossed.
+    if kind = piece_kind::king then
+      if target = source + 2 then
+        aux_source <- to_byte(source + 3)
+        aux_target <- to_byte(source + 1)
+        return move_kind::castle
+      end if
+
+      if target + 2 = source then
+        aux_source <- to_byte(source - 4)
+        aux_target <- to_byte(source - 1)
+        return move_kind::castle
+      end if
+    end if
+
+    # En passant: a pawn onto the (empty) ep square.  The captured pawn
+    # stands beside it: the target's file on the source's rank.
+    if kind = piece_kind::pawn and target = .position.ep_square
+    | and .position.board[target] = piece_kind::none then
+      aux_source <- to_byte(math::bit_and(target, 7)
+      |                   + math::bit_and(source, 56))
+      return move_kind::en_passant
+    end if
+
+    return move_kind::normal
+  end hook
+
+  # ---------------------------------------------------------------------------
+  func _reset_find_outputs()
+    .found_source <- square::none
+    .found_target <- square::none
+    .found_promo <- piece_kind::none
+    .found_stat_nodes <- $8000_0000 # N/A
+    .found_stat_depth <- $8000_0000
+    .found_stat_score <- $8000_0000
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Subclasses can call this to update the .status member based on orthodox
+  # chess rules, assuming that .in_check has been set correctly, whereas a
+  # subcless with unusual/fairy chess rules can assign .status directly.
+  func _update_game_status(has_legal_move: bool)
+    if has_legal_move then
+      .status <- game_status::playing
+    elsif .in_check then
+      # The side to move is checkmated.
+      if .position.side_to_move = color::white then
+        .status <- game_status::black_won
+      else
+        .status <- game_status::white_won
+      end if
+    else
+      .status <- game_status::draw    # stalemate
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Optional: Fails unless the constructor set can_find_move=true.
+  # Search for a move for the current side_to_move, updating "found_source"
+  # and other outputs. The chess_position is not modified; instead, the move
+  # is accepted by calling try_move().  To avoid ambiguity, the search must
+  # always produce a proposal when a legal move exists (therefore limits
+  # should not be considered until that is accomplished). If no legal move
+  # exists, set found_source to square::none.
+  #
+  # To limit the search duration, specify the end time in deadline_clock_ms.
+  # A value of 0 disables this limit.  The deadline has passed when
+  # "deadline_clock_ms - io::clock_ms <= 0", tested this way so that clock
+  # rollover is handled correctly.  To avoid time forfeits in a tournament,
+  # subclasses must check it often enough to normally return within 100 ms.
+  #
+  # The node_budget parameter provides a deterministic limit measured in
+  # the engine-specific "nodes", where larger values allow more thinking,
+  # and 0 disables the limit.  Note that "found_stat_nodes" uses the same units,
+  # but may report $8000_0000 if the scale is uninteresting to display.
+  #
+  # The on_progress callback allows the front end to perform realtime
+  # updates such as moving the mouse cursor; specify null to disable it
+  # (for example during a harness/tournament).  The subclass should call
+  # on_progress at least once per video frame, with the chess_engine
+  # outputs in a consistent state.  Besides reading the outputs,
+  # on_progress must not invoke any chess_engine methods.  If it returns
+  # false (for example the user cancelled the search), the search stops
+  # and returns the best proposal so far, within roughly 100 ms.
+  #
+  # To ensure predictable timing, find_move() and on_progress should avoid
+  # garbage collections by avoiding the "new" operator.
+  new hook find_move(deadline_clock_ms: int, node_budget: int,
+  | on_progress: find_on_progress)
+    kernel::fail("chess_engine::find_move not implemented")
+  end hook
+end class

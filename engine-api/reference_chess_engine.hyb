@@ -1,0 +1,729 @@
+# =============================================================================
+# REFERENCE CHESS ENGINE                                     VERSION 2026-08-01
+# =============================================================================
+# This is a reference subclass of chess_engine that implements all four of the
+# optional engine features.  Its find_move() is a trivial search algorithm
+# for testing purposes that simply returns the first legal move.  All orthodox
+# rules are modeled including check, checkmate, and stalemate, however the
+# front end is expected to handle draw claims (threefold repetition, the
+# fifty-move rule) and automatic draws (insufficient material).
+
+class reference_chess_engine extends chess_engine
+  # This engine mutates .position in place, so before applying a move, it
+  # copies the old state into _scratch_position.  This is used to calculate
+  # undo tokens and to revert moves during legality tests.
+  var _scratch_position: chess_position
+
+  # ---------------------------------------------------------------------------
+  constructor()
+    base()
+    .name <- "Reference Engine"
+
+    .can_load_position <- true
+    .can_undo_move <- true
+    .can_collect_moves <- true
+    .can_find_move <- true
+
+    ._scratch_position <- new chess_position()
+  end constructor
+
+  # ---------------------------------------------------------------------------
+  hook on_load_new_game()
+    ._refresh_verdict()
+  end hook
+
+  # ---------------------------------------------------------------------------
+  hook on_load_position()
+    ._refresh_verdict()
+  end hook
+
+  # ---------------------------------------------------------------------------
+  hook on_try_move(source: square, target: square, promo: piece_kind): bool
+    var mover_color: color
+    mover_color <- .position.side_to_move
+
+    # "source" must hold the mover's piece, the one precondition that
+    # _is_legal_move() cannot check by itself
+    if not piece::belongs_to(.position.board[source], mover_color)
+    do return false
+
+    if not ._is_legal_move(source, target)
+    do return false
+
+    var promoting: bool
+    promoting <- ._is_promotion(
+    | piece::get_kind(.position.board[source]), target)
+
+    if promoting and (promo < piece_kind::knight or promo > piece_kind::queen)
+    do return false
+
+    if not promoting and promo <> piece_kind::none
+    do return false
+
+    # _is_legal_move() proved legality on a scratch copy; now apply for
+    # real.  The guards above ensure promo = none whenever not promoting,
+    # so it can be passed straight through.
+    ._scratch_position.copy_from(.position)
+    ._make_move(source, target, promo)
+
+    .last_captured <- ._get_captured_piece(source, target)
+    .last_undo_token <- ._pack_undo_token(source, target, promoting)
+
+    ._refresh_verdict()
+    return true
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Pack the token that reverses the move try_move() just applied.  Called
+  # after _make_move() and the king-safety check, while ._scratch_position
+  # still holds the pre-move position, which is where every "before" field
+  # is read.
+  #
+  # last_undo_token layout (bit 31 stays clear, so tokens are non-negative):
+  #
+  #   bits  0..7   halfmove_clock before the move (255 = saturated)
+  #   bits  8..12  captured piece code, 0..31 (0 = none)
+  #   bits 13..16  castling rights before the move
+  #   bits 17..24  ep_square before the move (255 = square::none)
+  #   bit  25      the move was an en-passant capture
+  #   bit  26      the move was a promotion
+  func _pack_undo_token(source: square, target: square, promoting: bool): int
+    # Every "before" field is read from the pre-move snapshot; alias it.
+    var scratch: chess_position
+    scratch <- ._scratch_position
+
+    var was_ep: bool, captured: piece, token: int
+    was_ep <-
+    | piece::get_kind(scratch.board[source]) = piece_kind::pawn
+    | and target = scratch.ep_square
+    | and scratch.board[target] = piece_kind::none
+
+    captured <- ._get_captured_piece(source, target)
+
+    token <- scratch.halfmove_clock                              # bits 0..7
+    token <- math::bit_or(token, math::shift_left(captured, 8))  # bits 8..12
+    token <- math::bit_or(token,
+    | math::shift_left(scratch.castling, 13))                    # bits 13..16
+
+    token <- math::bit_or(token,
+    | math::shift_left(scratch.ep_square, 17))                   # bits 17..24
+
+    if was_ep
+    do token <- math::bit_or(token, $0200_0000)                  # bit 25
+
+    if promoting
+    do token <- math::bit_or(token, $0400_0000)                  # bit 26
+
+    return token
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Reverse the most recent try_move(), decoding the layout above.  Inputs
+  # are trusted per the contract; only gross misuse is asserted.
+  hook undo_move(source: square, target: square, token: int)
+    # Decode the token.
+    var clock: byte, captured: piece, rights: castling, ep: square
+    var was_ep: bool, was_promo: bool
+    clock <- to_byte(math::bit_and(token, 255))
+    captured <- to_byte(math::bit_and(
+    | math::shift_right_unsigned(token, 8), 31))
+
+    rights <- to_byte(math::bit_and(math::shift_right_unsigned(token, 13), 15))
+
+    ep <- to_byte(math::bit_and(math::shift_right_unsigned(token, 17), 255))
+
+    was_ep <- math::bit_and(token, $0200_0000) <> 0
+    was_promo <- math::bit_and(token, $0400_0000) <> 0
+
+    # This hook rewrites .position and its board throughout; alias both
+    # once, exactly as _make_move() does.
+    var position: chess_position, board: piece[]
+    position <- .position
+    board <- position.board
+
+    # undo runs after the move, so the side to move has already flipped;
+    # the piece we are pulling back belongs to its opponent.
+    var mover_color: color
+    mover_color <- color::get_opponent(position.side_to_move)
+
+    # Catch some obvious problems
+    if board[source] <> piece_kind::none
+    do kernel::fail("undo_move: source square is occupied")
+
+    if not piece::belongs_to(board[target], mover_color)
+    do kernel::fail("undo_move: target is not the mover's piece")
+
+    var moved: piece
+    moved <- board[target]
+
+    position.side_to_move <- mover_color
+    if mover_color = color::black
+    do position.fullmove_number <- position.fullmove_number - 1
+
+    position.castling <- rights
+    position.ep_square <- ep
+    position.halfmove_clock <- clock
+
+    # Castling: the king's two-file hop identifies it; carry the rook back
+    # to its corner.
+    if piece::get_kind(moved) = piece_kind::king then
+      if target = source + 2 then
+        board[source + 3] <- board[source + 1]
+        board[source + 1] <- piece_kind::none
+      elsif target + 2 = source then
+        board[source - 4] <- board[source - 1]
+        board[source - 1] <- piece_kind::none
+      end if
+    end if
+
+    # The moving piece returns home; a promoted piece degrades back to a pawn.
+    if was_promo then
+      board[source] <- to_byte(piece_kind::pawn + mover_color)
+    else
+      board[source] <- moved
+    end if
+
+    # The captured piece returns: beside the target square for en passant,
+    # onto it otherwise (captured = 0 restores an empty square).
+    if was_ep then
+      board[target] <- piece_kind::none
+      board[._find_ep_victim(target, mover_color)] <- captured
+    else
+      board[target] <- captured
+    end if
+
+    ._refresh_verdict()
+
+    # "last_undo_token should be reset to 0 and last_captured should be
+    # reset to piece_kind::none"
+    .last_undo_token <- 0
+    .last_captured <- piece_kind::none
+  end hook
+
+  # ---------------------------------------------------------------------------
+  hook collect_moves(source: square, targets: square[size 64]): int
+    if source >= 64
+    do return 0
+
+    if not piece::belongs_to(.position.board[source], .position.side_to_move)
+    do return 0
+
+    # A simple brute force search
+    var count: int, target: int
+    count <- 0
+    target <- 0
+    loop
+      if target >= 64
+      do drop
+
+      if ._is_legal_move(source, to_byte(target)) then
+        targets[count] <- to_byte(target)
+        count <- count + 1
+      end if
+
+      target <- target + 1
+    end loop
+
+    return count
+  end hook
+
+  # ---------------------------------------------------------------------------
+  hook find_move(deadline_clock_ms: int, node_budget: int,
+  | on_progress: find_on_progress)
+    # Trivial implementation: return the first valid move if we can find one
+    ._find_first_move(false)
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Refresh .in_check and .status for the side now to move: the shared tail
+  # of every load hook, try_move(), and undo_move().  Sets .in_check, then
+  # lets the base map the standard verdict from it and the legal-move scan.
+  func _refresh_verdict()
+    var mover_color: color
+    mover_color <- .position.side_to_move
+    .in_check <- ._is_attacked(._find_king(mover_color),
+    | color::get_opponent(mover_color))
+
+    ._update_game_status(._find_first_move(true))
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Scan for the first legal move of the side to move.  Returns false when
+  # no legal move exists, which is exactly the checkmate-or-stalemate
+  # condition.  With check_only=true, that verdict is all it produces;
+  # otherwise it also publishes the move (or square::none) to the .found_
+  # outputs.  A pawn reaching the last rank must name its promotion piece.
+  func _find_first_move(check_only: bool): bool
+    var source: int, target: int
+    source <- 0
+    loop
+      if source >= 64
+      do drop
+
+      if piece::belongs_to(.position.board[source],
+      | .position.side_to_move) then
+        target <- 0
+        loop
+          if target >= 64
+          do drop
+
+          if ._is_legal_move(to_byte(source), to_byte(target)) then
+            if not check_only then
+              .found_source <- to_byte(source)
+              .found_target <- to_byte(target)
+
+              if ._is_promotion(piece::get_kind(.position.board[source]),
+              | to_byte(target)) then
+                .found_promo <- piece_kind::queen
+              else
+                .found_promo <- piece_kind::none
+              end if
+            end if
+
+            return true
+          end if
+
+          target <- target + 1
+        end loop
+      end if
+
+      source <- source + 1
+    end loop
+
+    if not check_only then
+      .found_source <- square::none
+      .found_target <- square::none
+      .found_promo <- piece_kind::none
+    end if
+
+    return false
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Return true when moving from "source" to "target" is fully legal for
+  # the side to move.  Nothing is committed: .position is unchanged on
+  # return.  This centralized definition is shared by try_move(),
+  # collect_moves(), and _find_first_move().  Callers must ensure that
+  # "source" holds the side-to-move's piece, and "target" must be 0..63.
+  func _is_legal_move(source: square, target: square): bool
+    var mover_color: color
+    mover_color <- .position.side_to_move
+
+    if not ._can_reach(source, target, mover_color, false)
+    do return false
+
+    # Pseudo-legal movement passed; now play the move on the real board,
+    # ask whether the mover's king is left attacked, and restore.  The
+    # promotion piece never affects legality, so _make_move()'s queen
+    # default (promo = none) is fine here.
+    ._scratch_position.copy_from(.position)
+    ._make_move(source, target, piece_kind::none)
+
+    var safe: bool
+    safe <- not ._is_attacked(._find_king(mover_color),
+    | color::get_opponent(mover_color))
+    .position.copy_from(._scratch_position)
+    return safe
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The single definition of piece movement: geometry, path, and occupancy
+  # for the piece of "mover_color" on "source" going to "target", excluding
+  # king safety.  Assumes only that "source" holds a piece of
+  # "mover_color"; the target filters (target <> source, and target not
+  # holding mover's own piece) are handled here, so callers may pass any
+  # target square.
+  #
+  # "attacking" selects which of two questions to answer.  false: can this
+  # piece legally move to "target"?  true: does this piece threaten
+  # "target" (could it capture an enemy piece standing there)?  The two
+  # modes diverge in three cases:
+  # - A king can be threatened but never captured; move mode rejects any
+  #   move onto a king, a capture that never arises in normal play.
+  # - A pawn threatens its diagonals even when empty, and never threatens
+  #   the squares it pushes to.
+  # - Castling is a move only.  Skipping it in attack mode also ends the
+  #   recursion, since the castling branch itself asks _is_attacked().
+  func _can_reach(source: square, target: square, mover_color: color,
+  |            attacking: bool): bool
+    # This function only reads the board, so alias it once for brevity.
+    var board: piece[]
+    board <- .position.board
+
+    # A piece never reaches its own square, and never captures its own
+    # side; rejecting both here also makes _is_path_clear()'s ray safe
+    # (a zero-length step would loop forever).
+    if target = source or piece::belongs_to(board[target], mover_color)
+    do return false
+
+    if not attacking and piece::get_kind(board[target]) = piece_kind::king
+    do return false
+
+    var kind: piece_kind
+    kind <- piece::get_kind(board[source])
+
+    var source_file: int, source_rank: int, target_file: int, target_rank: int
+    source_file <- math::bit_and(source, 7)
+    source_rank <- math::shift_right_unsigned(source, 3)
+    target_file <- math::bit_and(target, 7)
+    target_rank <- math::shift_right_unsigned(target, 3)
+
+    var file_diff: int, rank_diff: int, file_span: int, rank_span: int
+    file_diff <- target_file - source_file
+    rank_diff <- target_rank - source_rank
+    file_span <- file_diff
+    if file_span < 0
+    do file_span <- -file_span
+
+    rank_span <- rank_diff
+    if rank_span < 0
+    do rank_span <- -rank_span
+
+    if kind = piece_kind::pawn then
+      var ahead: int, home_rank: int
+      if mover_color = color::white then
+        ahead <- 1
+        home_rank <- 1
+      else
+        ahead <- -1
+        home_rank <- 6
+      end if
+
+      # Diagonals: always a threat; as a move, only a real or ep capture.
+      if file_span = 1 and rank_diff = ahead then
+        if attacking
+        do return true
+
+        if board[target] <> piece_kind::none
+        do return true
+
+        if target = .position.ep_square
+        do return true
+      end if
+
+      if not attacking then
+        # Single push onto an empty square.
+        if file_diff = 0 and rank_diff = ahead
+        | and board[target] = piece_kind::none
+        do return true
+
+        # Double push from the home rank, crossing an empty square.
+        if file_diff = 0 and rank_diff = ahead + ahead
+        | and source_rank = home_rank
+        | and board[source + 8 * ahead] = piece_kind::none
+        | and board[target] = piece_kind::none
+        do return true
+      end if
+
+      return false
+    end if
+
+    if kind = piece_kind::knight then
+      return (file_span = 1 and rank_span = 2)
+      | or (file_span = 2 and rank_span = 1)
+    end if
+
+    if kind = piece_kind::bishop then
+      return file_span = rank_span and file_span <> 0
+      | and ._is_path_clear(source, target, file_diff, rank_diff)
+    end if
+
+    if kind = piece_kind::rook then
+      return (file_diff = 0 or rank_diff = 0)
+      | and ._is_path_clear(source, target, file_diff, rank_diff)
+    end if
+
+    if kind = piece_kind::queen then
+      return (file_span = rank_span or file_diff = 0 or rank_diff = 0)
+      | and ._is_path_clear(source, target, file_diff, rank_diff)
+    end if
+
+    # King: one step in any direction...
+    if file_span <= 1 and rank_span <= 1
+    do return true
+
+    if attacking
+    do return false
+
+    # ...or castling: two files sideways from the home square.  The landing
+    # square is left to make/test/unmake; departure and crossed squares,
+    # which that test would miss, are checked here.
+    if rank_diff <> 0 or file_span <> 2
+    do return false
+
+    if mover_color = color::white and source <> 4
+    do return false
+
+    if mover_color = color::black and source <> 60
+    do return false
+
+    var step: int, castling_bit: int
+    if file_diff > 0 then
+      step <- 1
+      if mover_color = color::white then
+        castling_bit <- castling::white_king
+      else
+        castling_bit <- castling::black_king
+      end if
+    else
+      step <- -1
+      if mover_color = color::white then
+        castling_bit <- castling::white_queen
+      else
+        castling_bit <- castling::black_queen
+      end if
+    end if
+
+    if math::bit_and(.position.castling, castling_bit) = 0
+    do return false
+
+    # The squares between king and rook must be empty.  On the side where
+    # the rook starts farther from the king (step < 0), castling spans one
+    # more square, so that side needs a third square checked.
+    if board[source + step] <> piece_kind::none
+    do return false
+
+    if board[source + step + step] <> piece_kind::none
+    do return false
+
+    if step < 0 and board[source - 3] <> piece_kind::none
+    do return false
+
+    # Not castling out of check or through an attacked square.
+    var opponent: color
+    opponent <- color::get_opponent(mover_color)
+    if ._is_attacked(source, opponent)
+    do return false
+
+    if ._is_attacked(to_byte(source + step), opponent)
+    do return false
+
+    return true
+  end func
+
+  # ---------------------------------------------------------------------------
+  # True when "attacked" is attacked by the given side: some piece of that
+  # side could capture onto "attacked" by the normal rules of movement.
+  # This ignores whether that capture would be legal for its own king's
+  # sake, so a pinned piece still counts as attacking.  In practice
+  # callers ask only about a king's square, or the squares a castling king
+  # leaves or crosses.
+  func _is_attacked(attacked: square, side: color): bool
+    var source: int
+    source <- 0
+    loop
+      if source >= 64
+      do drop
+
+      if piece::belongs_to(.position.board[source], side)
+      | and ._can_reach(to_byte(source), attacked, side, true)
+      do return true
+
+      source <- source + 1
+    end loop
+
+    return false
+  end func
+
+  # ---------------------------------------------------------------------------
+  # True when every square strictly between "source" and "target" is empty,
+  # walking one step at a time along the already validated straight line.
+  # This loop could run off the board, except that _can_reach() has confirmed
+  # a real rook/bishop line with source <> target, so the walk always lands
+  # on "target".
+  func _is_path_clear(source: square, target: square, file_diff: int,
+  |           rank_diff: int): bool
+    var step: int, scan_square: int
+    step <- 0
+    if file_diff > 0
+    do step <- step + 1
+
+    if file_diff < 0
+    do step <- step - 1
+
+    if rank_diff > 0
+    do step <- step + 8
+
+    if rank_diff < 0
+    do step <- step - 8
+
+    scan_square <- source + step
+    loop
+      if scan_square = target
+      do return true
+
+      if .position.board[scan_square] <> piece_kind::none
+      do return false
+
+      scan_square <- scan_square + step
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Apply a move to .position mechanically: board, castling rights,
+  # en-passant square, clocks, and side to move.  No legality checking;
+  # callers pass only moves they have already vetted for king safety.
+  # When the move promotes, promo determines the new piece (which defaults
+  # to queen when promo = piece_kind::none).
+  func _make_move(source: square, target: square, promo: piece_kind)
+    var position: chess_position, board: piece[]
+    position <- .position
+    board <- position.board
+
+    var moved_piece: piece, mover_color: color
+    var kind: piece_kind, captured: bool
+    moved_piece <- board[source]
+    mover_color <- position.side_to_move
+    kind <- piece::get_kind(moved_piece)
+    captured <- board[target] <> piece_kind::none
+
+    # En passant: a diagonal move onto the empty ep square captures the
+    # pawn beside it, not on it.
+    if kind = piece_kind::pawn and target = position.ep_square
+    | and board[target] = piece_kind::none then
+      board[._find_ep_victim(target, mover_color)] <- piece_kind::none
+
+      captured <- true
+    end if
+
+    # Castling: carry the rook over.
+    if kind = piece_kind::king then
+      if target = source + 2 then
+        board[source + 1] <- board[source + 3]
+        board[source + 3] <- piece_kind::none
+      elsif target + 2 = source then
+        board[source - 1] <- board[source - 4]
+        board[source - 4] <- piece_kind::none
+      end if
+    end if
+
+    # Rights: a king move loses both of its side's; a rook leaving a home
+    # corner, or anything landing on one (capturing it), loses that corner.
+    if kind = piece_kind::king then
+      if mover_color = color::white then
+        position.castling <- to_byte(math::bit_and(position.castling,
+        | castling::black_king + castling::black_queen))
+      else
+        position.castling <- to_byte(math::bit_and(position.castling,
+        | castling::white_king + castling::white_queen))
+      end if
+    end if
+
+    ._clear_castling_right_at(source)
+    ._clear_castling_right_at(target)
+
+    # A promoting pawn becomes promo, or a queen when promo is none.
+    if ._is_promotion(kind, target) then
+      var chosen: piece_kind
+      chosen <- promo
+      if chosen = piece_kind::none
+      do chosen <- piece_kind::queen
+
+      board[target] <- to_byte(chosen + mover_color)
+    else
+      board[target] <- moved_piece
+    end if
+
+    board[source] <- piece_kind::none
+
+    # En-passant square: set after a double step, cleared otherwise.
+    if kind = piece_kind::pawn
+    | and (target = source + 16 or target + 16 = source) then
+      if mover_color = color::white then
+        position.ep_square <- to_byte(source + 8)
+      else
+        position.ep_square <- to_byte(source - 8)
+      end if
+    else
+      position.ep_square <- square::none
+    end if
+
+    # Clocks: the halfmove clock saturates at 255 rather than wrapping.
+    if kind = piece_kind::pawn or captured then
+      position.halfmove_clock <- 0
+    elsif position.halfmove_clock < 255 then
+      position.halfmove_clock <- to_byte(position.halfmove_clock + 1)
+    end if
+
+    if mover_color = color::black
+    do position.fullmove_number <- position.fullmove_number + 1
+
+    position.side_to_move <- color::get_opponent(mover_color)
+  end func
+
+  # ---------------------------------------------------------------------------
+  # After calling _make_move(), return the piece it captured, or
+  # piece_kind::none.  Separated so that _is_legal_move()'s trial moves
+  # don't repeatedly compute and discard it.
+  func _get_captured_piece(source: square, target: square): piece
+    var scratch: chess_position
+    scratch <- ._scratch_position
+
+    if piece::get_kind(scratch.board[source]) = piece_kind::pawn
+    | and target = scratch.ep_square
+    | and scratch.board[target] = piece_kind::none then
+      return scratch.board[._find_ep_victim(target, scratch.side_to_move)]
+    end if
+
+    return scratch.board[target]    # 0 when nothing was taken
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Clear the castling right belonging to a home corner square, if any.
+  func _clear_castling_right_at(corner: square)
+    var castling_bit: int
+    castling_bit <- 0
+    if corner = 0
+    do castling_bit <- castling::white_queen
+
+    if corner = 7
+    do castling_bit <- castling::white_king
+
+    if corner = 56
+    do castling_bit <- castling::black_queen
+
+    if corner = 63
+    do castling_bit <- castling::black_king
+
+    if castling_bit <> 0 then
+      .position.castling <- to_byte(math::bit_and(.position.castling,
+      | castling::all - castling_bit))
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # True when a piece of "kind" moving to "target" reaches the last rank,
+  # i.e. a pawn promoting.  Caller supplies the already-extracted kind.
+  func _is_promotion(kind: piece_kind, target: square): bool
+    return kind = piece_kind::pawn and (target < 8 or target >= 56)
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The square of the pawn captured en passant: one rank behind the ep
+  # square, since the capturing pawn lands on the empty ep square itself.
+  func _find_ep_victim(ep_square: square, mover_color: color): square
+    if mover_color = color::white then
+      return to_byte(ep_square - 8)
+    else
+      return to_byte(ep_square + 8)
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Note: validate() ensures we have exactly one king of each color.
+  func _find_king(king_color: color): square
+    var scan_square: int
+    scan_square <- 0
+    loop
+      if scan_square >= 64
+      do drop
+
+      if .position.board[scan_square] = (piece_kind::king + king_color)
+      do return to_byte(scan_square)
+
+      scan_square <- scan_square + 1
+    end loop
+
+    return square::none
+  end func
+end class

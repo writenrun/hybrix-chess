@@ -1,0 +1,404 @@
+# =============================================================================
+# CHESS CONSOLE                                              VERSION 2026-08-04
+# =============================================================================
+# A basic text console front end for testing chess_engine subclasses.
+
+module main
+  # Milliseconds the engine may think per move.
+  const budget_ms is 3000
+  # For deterministic regression testing, set budget_ms to 0 (no clock limit)
+  # and node_budget to a positive engine-specific node count.
+  const node_budget is 0
+
+  var _engine: chess_engine
+  var _input: byte[size 8]   # typed characters of the move being entered
+  var _input_len: byte
+  var _state: byte           # 0 = waiting for input, 1 = engine move pending
+  var _cancel: bool          # ESC stopped find_move() early (report note)
+
+  # Board printout symbols indexed by piece_kind (entry 0 unused: empty
+  # squares are drawn as shaded hatch glyphs instead).
+  var _symbols: string
+
+  # ---------------------------------------------------------------------------
+  func start()
+    engine::init()
+
+    console::init(io::tilemap_a)
+    if art::fonts.size > 0
+    do engine::tile_layer_a.load_tileset(art::fonts[0])
+
+    main::init(new reference_chess_engine())
+    #main::init(new micromax_chess_engine())
+
+    loop
+      engine::render()
+      engine::wait_for_paint()
+      engine::think()
+      console::think()
+      main::think()
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  func init(engine: chess_engine)
+    main::_symbols <- ".PNBRQK"
+
+    main::_engine <- engine
+    main::_input <- new byte[size 8]()
+    main::_input_len <- 0
+    main::_state <- 0
+    main::_cancel <- false
+
+    engine.load_new_game()
+
+    io::background_color <- 29
+
+    console::print("{cls}{5}CHESS CONSOLE{1} {$bb} ")
+    console::print(engine.name)
+    console::print("{n}{n}")
+    console::print("Type a move like {quote}e2e4{quote}, then ENTER.{n}")
+    console::print("{quote}new{quote} to start a new game.{n}")
+
+    if engine.can_find_move then
+      console::print("ENTER alone for a computer move.{n}")
+      console::print("ESC to stop thinking.{n}")
+    end if
+
+    main::_print_board()
+    main::_prompt()
+  end func
+
+  # ---------------------------------------------------------------------------
+  func think()
+    if main::_state = 1 then
+      # "Thinking..." was painted last frame; now actually think (blocking).
+      main::_engine_move()
+      main::_state <- 0
+      return
+    end if
+
+    loop
+      var c: byte
+      c <- console::read_key()
+      if c = 0
+      do drop
+
+      main::_on_key(c)
+      if main::_state <> 0
+      do drop
+    end loop
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _on_key(c: byte)
+    if c = 10 then # 10 = ENTER
+      main::_on_enter()
+    elsif c = 8 then # 8 = BACKSPACE
+      if main::_input_len > 0 then
+        main::_input_len <- to_byte(main::_input_len - 1)
+        console::print("{l} {l}")
+      end if
+    elsif c = '{esc}' then # ESC = clear the typed input
+      # (ESC during thinking never reaches here; _on_find_progress eats it.)
+      loop
+        if main::_input_len = 0
+        do drop
+
+        main::_input_len <- to_byte(main::_input_len - 1)
+        console::print("{l} {l}")
+      end loop
+    elsif(c >= 'a' and c <= 'z') or (c >= '1' and c <= '8') then
+      if main::_input_len < 4 then
+        main::_input[main::_input_len] <- c
+        main::_input_len
+        | <- to_byte(main::_input_len + 1)
+
+        console::print_char(c)
+      end if
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _new_game()
+    main::_engine.load_new_game()
+    console::print("{n}{n}{5}new game{1}{n}")
+    main::_print_board()
+    main::_prompt()
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _on_enter()
+    if main::_input_len = 0 then
+      # Empty line: the engine plays the side to move.
+      if not main::_engine.can_find_move then
+        console::print("{n}{2}This engine cannot choose a move.{1}")
+        main::_prompt()
+        return
+      end if
+
+      console::cursor_visible <- false
+      console::print("{cll}{4}Thinking...")
+      main::_state <- 1
+      return
+    end if
+
+    # "new" starts a new game.
+    if main::_input_len = 3
+    | and main::_input[0] = 'n'
+    | and main::_input[1] = 'e'
+    | and main::_input[2] = 'w' then
+
+      main::_new_game()
+      return
+    end if
+
+    if main::_input_len <> 4 then
+      console::print("{n}{2}Type a move like e2e4{1}")
+      main::_reset_input()
+      main::_prompt()
+      return
+    end if
+
+    # Positions 0,2 must be files a-h, 1,3 ranks 1-8.  The key filter
+    # admits a-z (so "new" can be typed) but only the digits 1-8, so a
+    # rank slot only needs the "> '8'" test to reject letters.
+    if main::_input[0] < 'a' or main::_input[0] > 'h'
+    | or main::_input[2] < 'a' or main::_input[2] > 'h'
+    | or main::_input[1] > '8' or main::_input[3] > '8' then
+      console::print("{n}{2}Type a move like e2e4{1}")
+      main::_reset_input()
+      main::_prompt()
+      return
+    end if
+
+    # Contract square = 8 * (typed rank - 1) + file, e.g. e2 -> 12.
+    var source: square, target: square
+    source <- to_byte(
+    | 8 * (main::_input[1] - '1') + main::_input[0] - 'a')
+
+    target <- to_byte(
+    | 8 * (main::_input[3] - '1') + main::_input[2] - 'a')
+
+    main::_reset_input()
+
+    # A pawn arriving on the last rank always promotes to a queen; the
+    # 4-character move format cannot express another choice.  If the move
+    # is not actually a legal promotion, try_move() will reject it anyway.
+    var promo: piece_kind
+    promo <- piece_kind::none
+    if piece::get_kind(main::_engine.position.board[source])
+    | = piece_kind::pawn and (target < 8 or target >= 56)
+
+    do promo <- piece_kind::queen
+
+    if main::_engine.try_move(source, target, promo) then
+      console::print("{n}")
+      main::_print_board()
+      main::_announce_game_status()
+    else
+      console::print("{n}{2}Illegal move{1}")
+    end if
+
+    main::_prompt()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Think up and play a move for the side to move (blocking).
+  func _engine_move()
+    var engine: chess_engine
+    engine <- main::_engine
+
+    var start_ms: int
+    start_ms <- io::clock_ms
+
+    main::_cancel <- false
+
+    var deadline_ms: int
+    deadline_ms <- 0
+    if main::budget_ms > 0 then
+      deadline_ms <- start_ms + main::budget_ms
+
+      # Don't accidentally set deadline_ms=0, since 0 means "no limit"
+      if deadline_ms = 0
+      do deadline_ms <- 1
+    end if
+
+    engine.find_move(deadline_ms, main::node_budget,
+    | (main::_on_find_progress))
+
+    # Measure how much time was spent thinking
+    var elapsed_ms: int
+    elapsed_ms <- io::clock_ms - start_ms
+
+    # Snapshot the proposal before calling try_move(): the contract does
+    # not promise that the found_* outputs survive a state-refreshing call.
+    var found_source: square, found_target: square, found_promo: piece_kind
+    var found_stat_nodes: int
+    found_source <- engine.found_source
+    found_target <- engine.found_target
+    found_promo <- engine.found_promo
+    found_stat_nodes <- engine.found_stat_nodes
+
+    console::print("{7} ")
+
+    if main::_cancel
+    do console::print("ESC ")
+
+    if found_stat_nodes <> $8000_0000 then
+      console::print_int(found_stat_nodes)
+      console::print(" nodes, ")
+    end if
+
+    console::print_int(elapsed_ms)
+    console::print(" ms")
+
+    console::print("{1}")
+
+    if found_source = square::none then
+      console::print("{n}{3}No legal move - Game Over!{1}")
+      main::_announce_game_status()
+      main::_prompt()
+      return
+    end if
+
+    if engine.try_move(found_source, found_target, found_promo) then
+      console::print("{n}{4}Move: ")
+      main::_print_square(found_source)
+      main::_print_square(found_target)
+
+      # A promotion prints its piece as a lowercase suffix, like e7e8q
+      # (+32 converts the HASCII character to lowercase).
+      if found_promo <> piece_kind::none then
+        console::print_char(
+        | to_pair(main::_symbols[found_promo] + 32))
+      end if
+
+      console::print("{1}{n}")
+      main::_print_board()
+      main::_announce_game_status()
+    else
+      # This would indicate an engine bug
+      console::print("{n}{2}Engine proposed an illegal move!{1}")
+    end if
+
+    main::_prompt()
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The callback for find_move(). It stops the search if ESC is pressed.
+  func _on_find_progress(): bool
+    loop
+      var c: byte
+      c <- console::read_key()
+      if c = 0
+      do drop
+
+      if c = '{esc}'
+      do main::_cancel <- true
+    end loop
+
+    return not main::_cancel
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _announce_game_status()
+    var status: game_status
+    status <- main::_engine.status
+
+    if status = game_status::white_won then
+      console::print("{n}{3}Checkmate - White wins!{1}")
+    elsif status = game_status::black_won then
+      console::print("{n}{3}Checkmate - Black wins!{1}")
+    elsif status = game_status::draw then
+      console::print("{n}{3}Stalemate!{1}")
+    elsif main::_engine.in_check then
+      console::print("{n}{4}Check!{1}")
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _print_board()
+    console::print("{n}")
+
+    var board: piece[]
+    board <- main::_engine.position.board
+
+    var rank: int, file: int, piece: int
+    rank <- 7                             # rank 8 at the top, White below
+    loop
+      if rank < 0
+      do drop
+
+      # Rank label in blue.
+      console::print_char('{7}')
+      console::print_char(to_pair('1' + rank))
+      console::print_char(' ')
+
+      file <- 0
+      loop
+        if file >= 8
+        do drop
+
+        piece <- board[rank * 8 + file]
+        if piece = piece_kind::none then
+          # Empty: a {///} hatch glyph colored as the square shade.
+          # a1 (rank 0, file 0) is dark, so even (rank+file) -> {0} black
+          # and odd -> {1} white.
+          if math::bit_and(rank + file, 1) = 0 then
+            console::print_char('{0}')     # dark square
+          else
+            console::print_char('{1}')     # light square
+          end if
+
+          console::print_char('{///}')     # hatch glyph
+        else
+          # Piece: letter glyph tinted by side; the denim background shows
+          # through (square shade is not indicated under a piece).
+          if piece::belongs_to(to_byte(piece), color::white) then
+            console::print_char('{1}')     # white piece
+          else
+            console::print_char('{0}')     # black piece
+          end if
+
+          console::print_char(
+          | main::_symbols[piece::get_kind(to_byte(piece))])
+        end if
+
+        file <- file + 1
+      end loop
+
+      console::print_char('{1}')           # back to white text
+      console::print("{n}")
+      rank <- rank - 1
+    end loop
+
+    console::print("{7}  abcdefgh{1}{n}")
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Print a square like "e2": file letter from bits 0..2, rank digit from
+  # bits 3..5.
+  func _print_square(square: square)
+    console::print_char(to_pair('a' + math::bit_and(square, 7)))
+    console::print_char(to_pair('1' + math::shift_right_unsigned(square, 3)))
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _prompt()
+    if main::_engine.position.side_to_move = color::white then
+      console::print_char('{1}')  # white prompt: white to move
+    else
+      console::print_char('{0}')  # black prompt: black to move
+    end if
+
+    console::print("{n}> ")
+    console::cursor_visible <- true
+    main::_reset_input()
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _reset_input()
+    main::_input_len <- 0
+  end func
+end module
