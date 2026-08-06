@@ -1,0 +1,5 @@
+*.hyb   linguist-language=Nim
+*.casm  linguist-language=Shell
+
+*.hyb   linguist-detectable=false
+*.casm  linguist-detectable=false
