@@ -6,6 +6,13 @@ Source code for the Chombit Chess video game, an API for chess-playing engines, 
 
 ## Chombit Chess
 
+<table><tr><td align="center" style="border:1px solid var(--vscode-editorWidget-border,#888);border-radius:6px;background:var(--vscode-textCodeBlock-background);padding:8px">
+  <a href="https://www.hybrix.dev/roms/chombit-chess-ymtw9393hy2k">
+    <img src="https://www.hybrix.dev/content/releases/83bbk3tk2cq4-thumb.webp" alt="Chombit Chess demo screenshot" width="320" style="display:block">
+    <div style="margin-top:6px">Click to see it run!</div>
+  </a>
+</td></tr></table>
+
 A full chess video game: pieces on a perspective board, a mouse-driven wand for picking squares, legal destinations highlighted on selection, and a status bar for undo, new game, and switching either side between Human and Robot. The Robot uses [Micro-Max](https://home.hccnet.nl/h.g.muller/max-src2.html) by H.G. Muller, ported to Hybrix with his permission; the source is not yet included in this repository. Difficulty controls the search time (Easy = 2 secs, Medium = 8 secs, Hard = 30 secs). Artwork and sound resources are in the Hybrix Designer's native formats, but will be made inspectable later.
 
 For more details about this game, see [the Hybrix website docs](https://www.hybrix.dev/ref/chess-demo).
@@ -43,6 +50,13 @@ The `reference_chess_engine` class implements all four features, using the ortho
 To write your own engine, subclass `chess_engine`, set the `can_` flags for the features you support, then fill in the hooks. If it plays well, we may incorporate it into the official Chombit Chess game as an alternate computer player.
 
 ## Chess Console
+
+<table><tr><td align="center" style="border:1px solid var(--vscode-editorWidget-border,#888);border-radius:6px;background:var(--vscode-textCodeBlock-background);padding:8px">
+  <a href="https://www.hybrix.dev/roms/chess-console-5wtx5t5x4bxt">
+    <img src="https://www.hybrix.dev/content/releases/dy8kdd9674m5-thumb.webp" alt="Chess Console demo screenshot" width="320" style="display:block">
+    <div style="margin-top:6px">Click to see it run!</div>
+  </a>
+</td></tr></table>
 
 A [HASCII](https://www.hybrix.dev/docs/machine/sheets/hascii) console chess game in the spirit of the original Micro-Max stdio loop. Type a move like `e2e4` and press ENTER, or press ENTER alone to let the engine move, or ESC to stop it thinking. Each computer move reports its node count and elapsed milliseconds.
 
