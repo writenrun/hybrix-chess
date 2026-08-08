@@ -13,7 +13,7 @@ Source code for the Chombit Chess video game, an API for chess-playing engines, 
   </a>
 </td></tr></table>
 
-A full chess video game: pieces on a perspective board, a mouse-driven wand for picking squares, legal destinations highlighted on selection, and a status bar for undo, new game, and switching either side between Human and Robot. The Robot uses Micro-Max (see below), with difficulty controlling the search time (Easy = 2 secs, Medium = 8 secs, Hard = 30 secs). Artwork and sound resources are in the Hybrix Designer's native formats, but will be made inspectable later.
+A full chess video game: pieces on a perspective board, a mouse-driven wand for picking squares, legal destinations highlighted on selection, and a status bar for undo, new game, and switching either side between Human and Robot. The Robot uses Micro-Max (see below), with difficulty controlling the search time (Easy = 200 ms, Medium = 6 secs, Hard = 30 secs). Artwork and sound resources are in the Hybrix Designer's native formats, but will be made inspectable later.
 
 For more details about this game, see [the Hybrix website docs](https://www.hybrix.dev/ref/chess-demo).
 

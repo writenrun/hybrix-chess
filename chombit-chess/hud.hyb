@@ -410,9 +410,9 @@ end module
 
 data hud::level_ms
 [
-  2000,   # Easy
-  8000,   # Medium
-  30000   # Hard
+  200,  # Easy
+  6000, # Medium
+  30000 # Hard
 ]
 end data
 
