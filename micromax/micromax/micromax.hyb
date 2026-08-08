@@ -1,0 +1,1510 @@
+# =============================================================================
+# MICRO-MAX CHESS ENGINE                                     VERSION 2026-08-05
+# =============================================================================
+# (c) Write 'n' Run LLC and H.G. Muller; see accompanying license for details.
+#
+# A chess_engine subclass that implements Micro-Max 3.2 by H.G. Muller,
+# ported with his permission (talkchess.com t=86409).  Micro-Max is famous
+# as a complete chess program compressed into ~2,000 characters of C, and
+# the author's tutorial site explains the algorithm in detail.  Comments
+# below cite its pages by file name, for example var.html:
+#
+#   https://home.hccnet.nl/h.g.muller/max-src2.html  the annotated source
+#   https://home.hccnet.nl/h.g.muller/var.html       every variable, indexed
+#   https://home.hccnet.nl/h.g.muller/maximax.txt    long-name rewrite of 3.2
+#
+# Naming convention: every identifier that corresponds to one of
+# Micro-Max's one-letter names keeps that letter as a prefix, so X becomes
+# x_best_from; members like ._b_board (b[]) put it after the underscore.
+# Most suffixes come from maximax.txt, and a name without a letter prefix
+# has no Micro-Max counterpart.
+#
+# Two encodings meet in this file:
+#
+#   contract (chess_engine.hyb)  Micro-Max internal (this module)
+#   ---------------------------  -------------------------------------
+#   color   white=0  black=16    color bit  white=8  black=16
+#   one pawn kind (1)            two pawn types: white=1, black=2
+#     (kinds 2..6 = N B R Q K)   (types 3=N 4=K 5=B 6=R 7=Q)
+#   square 0..63, rank*8+file,   square 0..119, 16*rank+file (0x88),
+#     rank 0 = White's home      White's home at the bottom (rank 7)
+#
+# The internal board is vertically flipped and re-indexed.  Translation
+# happens at hook boundaries, apart from collect_moves recording targets.
+
+module micromax
+  # Transposition table entries, a power of two (the base slot index is
+  # bit_and(key, u_tt_size - 1)).  10 spare entries cover both probe
+  # schemes: the classic scan reaches base + 9, the pair reaches base + 1.
+  const u_tt_size is 8192
+
+  # Selects the hash probe and replacement scheme.  Both schemes always
+  # compile, so they can be diffed side by side and A/B tested by flipping
+  # this value:
+  #   1 = the original 3.2 scheme: scan up to 9 consecutive slots for a
+  #       hit or a free one, the permanently empty slot 0 as the overflow
+  #       victim, and its store-time replacement test.
+  #   0 = the "shallowest of two" replacement the author recommended for
+  #       this port's small table (talkchess.com t=86409, p994439): a probe
+  #       considers a pair of adjacent entries, and a store replaces the
+  #       hit, else the shallower of the two.  Behaves like a much larger
+  #       table once the 8192 entries saturate.
+  const classic_hash is 0
+
+  # Recursion guard: at this depth the search returns the position's own
+  # evaluation instead of recursing, so no pile-up of extensions can
+  # overflow the stack.
+  const max_ply is 48
+
+  # Root iterative-deepening cap (Micro-Max's d < 98); the limits usually
+  # stop the search far sooner.
+  const max_depth is 16
+
+  const i_inf is 80000  # "infinity"; mate scores live near this value
+
+  const score_unit is 99  # w_piece_values are scaled by this literal
+
+  const c_promo_bonus is 799  # score for promoting a pawn to a queen
+
+  # Micro-Max's internal color codes (not the contract's).  A piece carries
+  # its color as this bit; the side to move is one of these two values.
+  # The two add up to 24, which is how the code flips sides: 24 - k_side
+  # in the search, k^24 in the hooks.  Keeping white at bit 3 also leaves
+  # bit_and(piece, 7) free for the piece type, while bit_and(k_side, 16)
+  # is already the contract's color code.
+  const white is 8
+  const black is 16
+
+  # Marks a piece that has not moved yet, set on every back-rank piece at
+  # setup (bit 32 of the piece encoding, encode.html).  Every move strips
+  # it, and only the castling logic reads it, so it is meaningful only for
+  # kings and rooks; on any other piece it is simply ignored.
+  const unmoved is 32
+
+  # 0x88 masks (M=$88, V=$70).  A square is off the board when
+  # bit_and(square, m_off_board) is nonzero.
+  const m_off_board is 136
+  const v_rank_mask is 112
+
+  # S=128: the internal "no square" sentinel (the contract's
+  # square::none=255 is translated at the boundary), and a flag bit
+  # inside transposition entries.
+  const s_no_square is 128
+
+  # ---------------------------------------------------------------------------
+  # Micro-Max's o[0..16]: step-vector lists for every piece, each list
+  # ended by 0.  The generator negates entries as it walks
+  # (r <- -o_step_vectors[j]); sliders re-negate to keep stepping along a
+  # ray.  Quirks preserved: the pawn-capture steps (-15, -17) double as
+  # part of the bishop list, and the pawn push lists share entries with
+  # the rook/queen lists.
+  var o_step_vectors: pair[]
+
+  # Micro-Max's o[17..23], re-indexed by piece type 1..7 (entry 0 unused):
+  # the index into o_step_vectors just before each type's first direction
+  # (the scan pre-increments, so type 2's -1 is valid).
+  #   1 white pawn -> 7   2 black pawn -> -1   3 knight -> 11
+  #   4 king -> 6         5 bishop -> 8        6 rook -> 3      7 queen -> 6
+  var o_first_dir: pair[]
+
+  # Micro-Max's o[24..31]: the back rank at game start, as internal piece
+  # types R N B Q K B N R.  Dealt out by on_load_new_game().
+  var o_initial_rank: byte[]
+
+  # Micro-Max's w[]: relative piece values indexed by type 0..7 (none,
+  # white pawn, black pawn, knight, king, bishop, rook, queen).  The
+  # king's -1 makes "captured value < 0" mean the king was taken.
+  var w_piece_values: pair[]
+
+  # Micro-Max's center-points table, precomputed into ROM because the
+  # original formula (file-4)^2 + (rank-3.5)^2 needs floating point.
+  # Indexed by internal square; low value = central.  The eval rewards
+  # moving a piece toward the center.
+  var center_points: byte[]
+
+  # Internal piece type (bit_and(piece, 7), 0..7) -> contract piece_kind.
+  # Both pawn types collapse to the single contract pawn kind.
+  var kind_of_type: byte[]
+end module
+
+# Micro-Max o[0..16]
+data micromax::o_step_vectors
+[
+  -16, -15, -17, 0, 1, 16, 0, 1, 16, 15, 17, 0, 14, 18, 31, 33, 0
+]
+end data
+
+# Index into o_step_vectors just before each type's first direction.
+data micromax::o_first_dir
+[
+  0, 7, -1, 11, 6, 8, 3, 6
+]
+end data
+
+# Back rank at game start: R N B Q K B N R as internal piece types.
+data micromax::o_initial_rank
+[
+  6, 3, 5, 7, 4, 5, 3, 6
+]
+end data
+
+# Relative piece values: -, Pw, Pb, N, K, B, R, Q.
+data micromax::w_piece_values
+[
+  0, 1, 1, 3, -1, 3, 5, 9
+]
+end data
+
+# Centrality: value of internal square (16*rank + file).  0x88-half unused.
+data micromax::center_points
+[
+  28, 21, 16, 13, 12, 13, 16, 21, 0, 0, 0, 0, 0, 0, 0, 0,
+  22, 15, 10,  7,  6,  7, 10, 15, 0, 0, 0, 0, 0, 0, 0, 0,
+  18, 11,  6,  3,  2,  3,  6, 11, 0, 0, 0, 0, 0, 0, 0, 0,
+  16,  9,  4,  1,  0,  1,  4,  9, 0, 0, 0, 0, 0, 0, 0, 0,
+  16,  9,  4,  1,  0,  1,  4,  9, 0, 0, 0, 0, 0, 0, 0, 0,
+  18, 11,  6,  3,  2,  3,  6, 11, 0, 0, 0, 0, 0, 0, 0, 0,
+  22, 15, 10,  7,  6,  7, 10, 15, 0, 0, 0, 0, 0, 0, 0, 0,
+  28, 21, 16, 13, 12, 13, 16, 21, 0, 0, 0, 0, 0, 0, 0, 0
+]
+end data
+
+# Internal type 0..7 -> contract piece_kind (both pawn types -> pawn).
+#   0 none  1 Pw->pawn  2 Pb->pawn  3 N->knight  4 K->king  5 B->bishop
+#   6 R->rook  7 Q->queen
+data micromax::kind_of_type
+[
+  0, 1, 1, 2, 6, 3, 4, 5
+]
+end data
+
+# =============================================================================
+# THE ENGINE
+# =============================================================================
+class micromax_chess_engine extends chess_engine
+  # ---------------------------------------------------------------------------
+  # Mutable state, all of it allocated exactly once by the constructor.
+  # The search itself never allocates, so a garbage collection can never
+  # interrupt a search.  Storing it in the instance rather than a module
+  # lets a front end discard one engine and load another, since the arrays
+  # belong to the object.
+
+  # The 0x88 board, internal square 0..119: a cell is 0 when empty, else
+  # piece type (bits 0..2) + color bit (8 or 16) + unmoved (32).  Element
+  # 128 is the dummy target square.  The search works on this board;
+  # .position is a projection updated after every accepted move.
+  var _b_board: byte[size 129]
+
+  # Zobrist keys: two 32-bit keys per (piece kind, internal square),
+  # replacing Micro-Max's overlapping T[] reads with a plain XOR table.
+  # Index (square*16 + bit_and(piece, 15))*2 + which, where which 0 = the
+  # slot-index key (J) and 1 = the verify key (Z).
+  var _t_zobrist: int[size 4096]
+
+  # Micro-Max's hash table A[] (int K,V; char X,Y,D) as five parallel
+  # arrays so the GC sees 5 blocks, not thousands of objects.  Each holds
+  # u_tt_size + 10 entries (see u_tt_size); slot 0 is the classic scheme's
+  # permanently empty overflow slot, an ordinary slot under the pair
+  # scheme.
+  var _a_tt_key: int[]    # K: verification key; 0 = empty slot
+  var _a_tt_score: int[]  # V: stored score
+  var _a_tt_from: byte[]  # X: best from-square + flags (8 lower, 128 upper)
+  var _a_tt_to: byte[]    # Y: best to-square + the non-castling marker
+  var _a_tt_depth: byte[] # D: depth the result was searched to
+
+  # Side to move as an internal color code (white=8 / black=16).
+  var _k_side: byte
+
+  # Internal en-passant / castling-transit state: the square a double-
+  # stepping pawn skipped, or s_no_square.  Translated to and from
+  # .position.ep_square at the boundary.
+  var _o_ep: byte
+
+  # Root evaluation baseline: the static score fed in as the eval of the
+  # current position, maintained across moves.
+  var _q_root_eval: int
+
+  # Nodes visited by the current search: the stat, and the cadence for the
+  # limit polls.  _hit_count separately paces a poll on usable hash hits,
+  # which return before they are counted as nodes (matching where the
+  # original places its N++).
+  var _n_nodes: int
+  var _hit_count: int
+
+  # The find_move() limits, copied from its parameters so the deep search
+  # can read them.  A deadline of 0 or a budget of 0 disables that limit.
+  var _deadline_ms: int
+  var _node_budget: int
+
+  # The on_progress callback for the current find_move (or null).
+  var _on_progress: find_on_progress
+
+  # Time control: the contract requires a proposal whenever a legal move
+  # exists, so the root arms _clock_active only after its first proposing
+  # iteration completes; once _stop is set, every level of the recursion
+  # returns as soon as it can.  A cancellation from the progress callback
+  # (which is polled from the very first node) waits in _stop_wanted until
+  # it may be honored as a real _stop.
+  var _clock_active: bool
+  var _stop: bool
+  var _stop_wanted: bool
+
+  # The internal move handed to or from the search, as squares 0..119.
+  # A move test reads them, and a root search writes its choice.
+  var _k_move_from: byte
+  var _l_move_to: byte
+
+  # Legal moves found by the last mode-10 counting search (see _search's
+  # mode codes).  Not part of an optional feature: _has_legal_move() needs
+  # it to keep .status correct.
+  var _legal_count: int
+
+  # --- FEATURE collect_moves: enumeration state (see the hook's banner).
+  var _list: square[size 64] # the caller's targets buffer
+  var _list_from: byte # internal from-square whose moves we are collecting
+  # --- end FEATURE collect_moves ---
+
+  # ---------------------------------------------------------------------------
+  # Allocate everything once and seed the Zobrist table.  Per the contract,
+  # .position stays null until the front end calls load_new_game(); this
+  # constructor must not touch the board or the hooks.
+  constructor()
+    base()
+    .name <- "Micro-Max 3.2"
+
+    # The base constructor cleared the other flags, and can_load_position
+    # stays false: see the header.
+    .can_collect_moves <- true
+    .can_undo_move <- true
+    .can_find_move <- true
+
+    ._b_board <- new byte[size 129]()
+    ._t_zobrist <- new int[size 4096]()
+
+    ._a_tt_key <- new int[](micromax::u_tt_size + 10)
+    ._a_tt_score <- new int[](micromax::u_tt_size + 10)
+    ._a_tt_from <- new byte[](micromax::u_tt_size + 10)
+    ._a_tt_to <- new byte[](micromax::u_tt_size + 10)
+    ._a_tt_depth <- new byte[](micromax::u_tt_size + 10)
+
+    # The original fills its key table from random().  This is xorshift32
+    # with the shifts 13, 17, 5, the same generator the Jamdac wave
+    # oscillator uses, seeded here so the keys come out identical on every
+    # run and a game is reproducible.
+    var seed: int, i: int
+    seed <- $2545_f491
+    i <- 0
+    loop
+      if i >= 4096
+      do drop
+
+      seed <- math::bit_xor(seed, math::shift_left(seed, 13))
+      seed <- math::bit_xor(seed, math::shift_right_unsigned(seed, 17))
+      seed <- math::bit_xor(seed, math::shift_left(seed, 5))
+      unsafe(._t_zobrist)[i] <- seed    # i proven 0..4095 by the guard above
+
+      i <- i + 1
+    end loop
+  end constructor
+
+  # ===========================================================================
+  # Encoding boundary: the chess_engine API (what these comments call the
+  # contract) <-> Micro-Max internal
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Contract square (0..63, rank 0 = White's home) -> internal 0x88 square.
+  # Callers pass real squares only, never the square::none sentinel.
+  func _to_micromax_square(sq: square): byte
+    # internal = 16*(7 - rank) + file = 112 - 16*rank + file
+    return to_byte(112 - 16 * math::shift_right_unsigned(sq, 3)
+    |            + math::bit_and(sq, 7))
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Internal 0x88 square -> contract square, or square::none for the sentinel.
+  func _to_api_square(msq: byte): square
+    if msq = micromax::s_no_square
+    do return square::none
+
+    # contract = 8*(7 - rank) + file
+    return to_byte(8 * (7 - math::shift_right_unsigned(msq, 4))
+    |            + math::bit_and(msq, 7))
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Internal piece -> contract piece (kind + color), 0 for empty.
+  func _to_api_piece(mp: byte): piece
+    if mp = 0
+    do return 0
+
+    # Contract color: the internal black bit (16) IS the contract black
+    # bit; the internal white bit (8) maps to contract 0 by masking it off.
+    return to_byte(micromax::kind_of_type[math::bit_and(mp, 7)]
+    |            + math::bit_and(mp, 16))
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Project the internal board back into .position after an accepted move:
+  # board contents, side to move, castling rights (read off the surviving
+  # unmoved bits), and the en-passant target.  Clocks and the fullmove
+  # number are bookkeeping the search never tracked, so try_move()
+  # maintains them separately.
+  func _project_position()
+    var sq: int
+    sq <- 0
+    loop
+      if sq >= 64
+      do drop
+
+      .position.board[sq] <- ._to_api_piece(
+      | ._b_board[._to_micromax_square(to_byte(sq))])
+
+      sq <- sq + 1
+    end loop
+
+    # Internal white=8 -> contract 0; internal black=16 -> contract 16.
+    .position.side_to_move <- to_byte(math::bit_and(._k_side, 16))
+    .position.castling <- ._get_castling_mask()
+
+    # Micro-Max's O does double duty: after a double pawn step it holds
+    # the skipped square (a true e.p. target), but after castling it holds
+    # the rook's landing square, which must not leak out as an e.p.
+    # target.  Tell them apart by occupancy, as Micro-Max does: a skipped
+    # square is empty, a castling rook square is not.
+    if ._o_ep <> micromax::s_no_square and ._b_board[._o_ep] = 0 then
+      .position.ep_square <- ._to_api_square(._o_ep)
+    else
+      .position.ep_square <- square::none
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Derive the contract castling mask from the unmoved bits: a right
+  # survives while both its king and its rook still carry one.  Every move
+  # strips the bit from the piece it moves, so an unmoved bit on a home
+  # corner can only belong to the original rook.
+  func _get_castling_mask(): castling
+    var c: int
+    c <- 0
+
+    if math::bit_and(._b_board[116], micromax::unmoved) <> 0 then  # white king
+      if math::bit_and(._b_board[119], micromax::unmoved) <> 0
+      do c <- c + castling::white_king
+
+      if math::bit_and(._b_board[112], micromax::unmoved) <> 0
+      do c <- c + castling::white_queen
+    end if
+
+    if math::bit_and(._b_board[4], micromax::unmoved) <> 0 then    # black king
+      if math::bit_and(._b_board[7], micromax::unmoved) <> 0
+      do c <- c + castling::black_king
+
+      if math::bit_and(._b_board[0], micromax::unmoved) <> 0
+      do c <- c + castling::black_queen
+    end if
+
+    return to_byte(c)
+  end func
+
+  # ---------------------------------------------------------------------------
+  func _poll_limits()
+    if ._on_progress <> null and not ._on_progress()
+    do ._stop_wanted <- true
+
+    if ._clock_active then
+      if ._stop_wanted
+      do ._stop <- true
+
+      if ._deadline_ms <> 0 and ._deadline_ms - io::clock_ms <= 0
+      do ._stop <- true
+
+      if ._node_budget <> 0 and ._n_nodes >= ._node_budget
+      do ._stop <- true
+    end if
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Empty the transposition table; called before every move test.
+  # (The +3 skips the array size field.)
+  func _clear_table()
+    kernel::set_memory_bytes(to_address(._a_tt_key) + 3, 0,
+    | (micromax::u_tt_size + 10) * 4)
+
+    kernel::set_memory_bytes(to_address(._a_tt_depth) + 3, 0,
+    | micromax::u_tt_size + 10)
+  end func
+
+  # ===========================================================================
+  # The search: Micro-Max's recursive negamax D(k,q,l,e,J,Z,E,z,n), plus a
+  # ply counter.  Parameters in the original order, each name prefixed with
+  # the letter it replaces:
+  #
+  #   k_side     side to move (8 white / 16 black)
+  #   q_alpha    best score already banked (alpha-ish window bound)
+  #   l_beta     score that causes a cutoff (beta-ish window bound)
+  #   e_eval     static evaluation of this position
+  #   j_hash_lo  hash key for the table index
+  #   z_hash_hi  hash key for verification
+  #   e_ep_sqr   e.p. / castling state from the parent
+  #   z_last_to  the previous move's target square, or a mode code:
+  #     8    root search: iterative deepening, propose a move
+  #     9    root move test: if (_k_move_from, _l_move_to) is legal, play it
+  #          (leave it on the board), return l_beta
+  #     10   root count: count every legal move into _legal_count; never
+  #          commits a move
+  #     11   root enumeration (FEATURE collect_moves): mode 10 pinned to
+  #          _list_from, also recording each target into _list
+  #     128  mate verification: can this side take the king?
+  #          All five codes land in the 0x88 off-board half, so a genuine
+  #          target square can never collide with them.
+  #   n_depth    requested depth; the root passes 0 and deepens instead
+  #   ply        recursion depth, hard-capped by max_ply (not in the original)
+  #
+  # Returns the score of the position from k_side's point of view.
+  #
+  # To follow max-src2.html side by side, the original control flow maps
+  # onto four numbered loops:
+  #
+  #   loop 100  W(d++<n | z==8 & N<1e7 & d<98)  iterative deepening
+  #   loop 200  do{..}W((x=x+9&~M)-B)           scan all squares for pieces
+  #   loop 300  W(r=p>2&r<0?-r:-o[++j])         directions of one piece
+  #   loop 400  do{H=y+=r; ..}W(!t)             one ray, square by square
+  #
+  #   goto A  (redo the ray after the best move) is a reset of
+  #           y_to_sqr followed by "lift 400"
+  #   goto C  (fail high, jump to the iteration wrap-up) is "drop 200"
+  # ===========================================================================
+  func _search(
+  | k_side: int, q_alpha: int, l_beta: int, e_eval: int,
+  | j_hash_lo: int, z_hash_hi: int, e_ep_sqr: int, z_last_to: int,
+  | n_depth: int, ply: int): int
+    # Recursion guard: return the static evaluation, never a stack fault.
+    if ply >= micromax::max_ply
+    do return e_eval
+
+    # Hash probe state
+    var a_slot: int, i_tries: int, h_probe_key: int
+
+    # The current iteration; v_score is the move being tried
+    var d_iter: int, x_best_from: int, y_best_to: int
+    var m_best_score: int, v_score: int
+
+    # The move being generated, and the square scan that finds the mover
+    var x_from_sqr: int, y_to_sqr: int, b_start_sqr: int, u_piece: int
+    var p_type: int, j_dir: int, r_step_vec: int
+
+    # h_capt_sqr shifts off y_to_sqr for e.p.; f_skip_sqr becomes the
+    # child's e.p./castling state; g_rook_sqr is the castling rook's corner
+    var h_capt_sqr: int, t_victim: int, i_capt_val: int
+    var f_skip_sqr: int, g_rook_sqr: int, h_child_depth: int
+
+    # The two XOR deltas mirror the J(0) and J(8) macros
+    var j_delta: int, z_delta: int, new_piece: int, zob_index: int
+
+    # No Micro-Max counterparts; the four 0/1 terms are its inline ! tests
+    var child_alpha: int, child_beta: int
+    var straight_move: int, empty_sqr: int          # pawn move-mode test
+    var no_left_pawn: int, no_right_pawn: int       # pawn structure eval
+    var x_store_flags: int
+    var store_ok: bool, keep_going: bool
+
+    var b_board: byte[size 129]
+    b_board <- ._b_board
+
+    # === Hash probe: two selectable schemes (see micromax::classic_hash).
+    # Both start from the same hashed base slot.
+    a_slot <- math::bit_and(math::bit_xor(k_side * e_ep_sqr, j_hash_lo),
+    |                       micromax::u_tt_size - 1)
+
+    if micromax::classic_hash <> 0 then
+      # The 3.2 probe (j=(k*E^J)&U-9; W((h=A[++j].K)&&h-Z&&--i)), see
+      # hash.html: from the hashed slot, scan up to 9 entries for our
+      # key or a free one.  The replacement policy is at the store site.
+      i_tries <- 9
+      loop
+        a_slot <- a_slot + 1
+        h_probe_key <- ._a_tt_key[a_slot]
+        if h_probe_key = 0
+        do drop              # first empty slot: a miss, store here later
+
+        if h_probe_key = z_hash_hi
+        do drop              # a hit
+
+        i_tries <- i_tries - 1
+        if i_tries = 0
+        do drop              # all 9 full, none match: use the dummy slot
+      end loop
+
+      if i_tries = 0
+      do a_slot <- 0
+    else
+      # The shallowest-of-two pair the author recommended for this port
+      # (talkchess.com t=86409, p994439), his patch line by line:
+      #   d=a->D;             remember the first slot's depth
+      #   a+=a->K!=Z;         first slot misses: try the second
+      #   a-=a->K-Z&&d<a->D;  both miss and the first is shallower:
+      #                       go back and replace the first
+      # The selected slot is the hit if either slot hits, else the
+      # shallower of the pair, which the store below replaces.  (d_iter is
+      # a scratch here, exactly as d is in that patch.)
+      d_iter <- ._a_tt_depth[a_slot]
+
+      if ._a_tt_key[a_slot] <> z_hash_hi
+      do a_slot <- a_slot + 1
+
+      if ._a_tt_key[a_slot] <> z_hash_hi and d_iter < ._a_tt_depth[a_slot]
+      do a_slot <- a_slot - 1
+    end if
+
+    h_probe_key <- ._a_tt_key[a_slot]
+
+    # === Examine the stored data, but only for a genuine hit.  The 3.2
+    # code tests if(a->K), which its probe makes sufficient; the pair
+    # scheme's slot can instead hold a stranger selected for replacement,
+    # so the verification key must be compared, as 4.8 does.  The <> 0
+    # term closes an inherited edge: a z_hash_hi of exactly 0 must read an
+    # empty slot as a miss, not a hit.
+    d_iter <- 0
+    x_best_from <- 0
+    y_best_to <- 0
+    if h_probe_key <> 0 and h_probe_key = z_hash_hi then
+      d_iter <- ._a_tt_depth[a_slot]
+      v_score <- ._a_tt_score[a_slot]
+      x_store_flags <- ._a_tt_from[a_slot]
+      if d_iter >= n_depth then
+        # Usable if window compatible: a cutoff needs the lower-bound flag
+        # (bit 3), a fail-low return needs the upper-bound flag (bit 7).
+        if (v_score >= l_beta or math::bit_and(x_store_flags, 128) <> 0)
+        | and (v_score <= q_alpha or math::bit_and(x_store_flags, 8) <> 0) then
+          # (Not in the original.)  A usable hit returns before the node
+          # poll below, so hits keep their own poll cadence to protect the
+          # UI and the deadline, without disturbing the node statistic.
+          ._hit_count <- ._hit_count + 1
+          if math::bit_and(._hit_count, 15) = 0
+          do ._poll_limits()
+
+          return v_score
+        end if
+
+        d_iter <- n_depth - 1               # else use it to start deepening
+      end if
+
+      x_best_from <- math::bit_and(x_store_flags, 119)   # strip the flags:
+      y_best_to <- ._a_tt_to[a_slot]                     # best-move hint
+      if d_iter = 0
+      do y_best_to <- 0               # don't try the best move at d_iter=0
+    end if
+
+    ._n_nodes <- ._n_nodes + 1
+
+    ._poll_limits()
+
+    # Fallback if the deepening loop runs zero times (it normally cannot;
+    # this also lets the compiler prove the return value is assigned).
+    m_best_score <- e_eval
+
+    # Root snapshot of the last completed iteration's best move, score,
+    # and depth; restored if a limit aborts an iteration partway, so every
+    # find_move output describes one and the same proposal.
+    var keep_from: int, keep_to: int, keep_score: int, keep_depth: int
+    keep_from <- x_best_from
+    keep_to <- y_best_to
+    keep_score <- e_eval
+    keep_depth <- 0
+
+    # === Iterative deepening (W(d++<n | z==8 & N<1e7 & d<98); deepen.html)
+    loop 100
+      keep_going <- d_iter < n_depth
+      if z_last_to = 8 and d_iter < micromax::max_depth and ._can_search_more()
+      do keep_going <- true
+
+      # The root must reach d_iter=2 unconditionally: d_iter=1 only
+      # stands pat, so d_iter=2 is the first iteration that can propose a
+      # move, and the contract demands a proposal before any limit
+      # applies.  (The original's node cap was too large to fire this
+      # early, so it never needed the guarantee.)
+      if z_last_to = 8 and d_iter < 2
+      do keep_going <- true
+
+      if ._stop
+      do keep_going <- false
+
+      # (Not in the original.)  A cancellation that arrived before any
+      # proposal existed is honored here, at an iteration boundary where
+      # no restore is needed; the mandatory d_iter < 2 iterations still
+      # proceed.
+      if z_last_to = 8 and ._clock_active and ._stop_wanted
+      do keep_going <- false
+
+      if not keep_going
+      do drop 100
+
+      d_iter <- d_iter + 1
+      keep_from <- x_best_from
+      keep_to <- y_best_to
+      keep_score <- m_best_score
+      keep_depth <- d_iter - 1
+
+      x_from_sqr <- x_best_from        # start the scan at the previous best
+      b_start_sqr <- x_best_from
+      if math::bit_and(y_best_to, 128) <> 0        # Y |= 8 & Y>>4:
+      do y_best_to <- math::bit_or(y_best_to, 8)   # request noncastl. 1st
+      # (sort.html explains this move ordering)
+
+      if d_iter > 1 then
+        m_best_score <- -micromax::i_inf   # unconsidered moves lose
+      else
+        m_best_score <- e_eval  # d_iter <= 1: stand pat (quiet.html)
+      end if
+
+      # === Scan the whole board for own pieces (Micro-Max's outer
+      # do-while; movgen.html).
+      loop 200
+        u_piece <- unsafe(b_board)[x_from_sqr]
+
+        # --- FEATURE collect_moves: mode 11 pins the scan to one
+        # from-square; pretend every other square is empty. ---
+        if z_last_to = 11 and x_from_sqr <> ._list_from
+        do u_piece <- 0
+
+        if math::bit_and(u_piece, k_side) <> 0 then
+          p_type <- math::bit_and(u_piece, 7)
+          r_step_vec <- p_type                          # any value > 0
+          j_dir <- unsafe(micromax::o_first_dir)[p_type]   # p_type: 1..7 < 8
+
+          loop 300                     # directions of this piece
+            if p_type > 2 and r_step_vec < 0 then
+              r_step_vec <- -r_step_vec   # sliders reuse each entry negated
+            else
+              j_dir <- j_dir + 1
+              # j_dir stays 0..16: every direction list is 0-terminated at
+              # or before index 16, and the terminator ends this loop.
+              r_step_vec <- -unsafe(micromax::o_step_vectors)[j_dir]
+            end if
+
+            if r_step_vec = 0
+            do drop 300                # 0 terminates the direction list
+
+            y_to_sqr <- x_from_sqr
+            f_skip_sqr <- micromax::s_no_square
+            g_rook_sqr <- micromax::s_no_square
+
+            loop 400                   # y_to_sqr traverses the ray
+              y_to_sqr <- y_to_sqr + r_step_vec
+              h_capt_sqr <- y_to_sqr
+              if math::bit_and(y_best_to, 8) <> 0 then
+                y_to_sqr <- math::bit_and(y_best_to, 119)  # sneak in the
+                h_capt_sqr <- y_to_sqr                     # best move
+              end if
+
+              if math::bit_and(y_to_sqr, micromax::m_off_board) <> 0
+              do drop 400              # board edge hit
+
+              # E.p. capture: the victim is beside the target (ep.html)
+              if p_type < 3 and y_to_sqr = e_ep_sqr
+              do h_capt_sqr <- math::bit_xor(y_to_sqr, 16)
+
+              t_victim <- unsafe(b_board)[h_capt_sqr]
+
+              straight_move <- 0
+              if math::bit_and(r_step_vec, 7) = 0
+              do straight_move <- 1
+
+              empty_sqr <- 0
+              if t_victim = 0
+              do empty_sqr <- 1
+
+              if math::bit_and(t_victim, k_side) <> 0
+              | or (p_type < 3 and straight_move <> empty_sqr)
+
+              do drop 400
+
+              i_capt_val <- micromax::score_unit
+              | * unsafe(micromax::w_piece_values)[math::bit_and(t_victim, 7)]
+
+              # King captured, or castling through check: a certain win
+              # (castle.html explains the rook-transit trick in e_ep_sqr)
+              if i_capt_val < 0
+              | or (e_ep_sqr <> micromax::s_no_square
+              |     and unsafe(b_board)[e_ep_sqr] <> 0
+              |     and y_to_sqr - e_ep_sqr < 2 and e_ep_sqr - y_to_sqr < 2)
+
+              do m_best_score <- micromax::i_inf
+
+              if m_best_score >= l_beta
+              do drop 200              # "goto C": abort on fail high
+
+              h_child_depth <- d_iter - 1        # remaining depth,
+              if y_to_sqr = z_last_to
+              do h_child_depth <- d_iter         # extended for recaptures
+
+              if h_child_depth <> 0 then
+                # Positional points: gain in centrality, not for R and Q
+                # (pcsqr.html)
+                if p_type < 6 then
+                  v_score <- unsafe(micromax::center_points)[x_from_sqr]
+                  | - unsafe(micromax::center_points)[y_to_sqr]
+                else
+                  v_score <- 0
+                end if
+
+                # --- Do the move, stripping the unmoved bit (move.html)
+                unsafe(b_board)[g_rook_sqr] <- 0
+                unsafe(b_board)[h_capt_sqr] <- 0
+                unsafe(b_board)[x_from_sqr] <- 0
+                unsafe(b_board)[y_to_sqr]
+                | <- to_byte(math::bit_and(u_piece, 31))
+
+                if math::bit_and(g_rook_sqr, micromax::m_off_board) = 0 then
+                  # Castling: place the rook and score the move
+                  unsafe(b_board)[f_skip_sqr] <- to_byte(k_side + 6)
+                  v_score <- v_score + 30
+                end if
+
+                if p_type < 3 then
+                  # Pawn structure: penalty per missing same-pawn
+                  # neighbor two files away, minus a bias (eval.html)
+                  no_left_pawn <- 0
+                  if math::bit_and(x_from_sqr - 2, micromax::m_off_board) <> 0
+                  | or unsafe(b_board)[x_from_sqr - 2] <> u_piece
+
+                  do no_left_pawn <- 1
+
+                  no_right_pawn <- 0
+                  if math::bit_and(x_from_sqr + 2, micromax::m_off_board) <> 0
+                  | or unsafe(b_board)[x_from_sqr + 2] <> u_piece
+
+                  do no_right_pawn <- 1
+
+                  v_score <- v_score - 9 * (no_left_pawn + no_right_pawn - 1)
+
+                  # Promotion to queen on the last rank (queen.html):
+                  # y+r+1&S, where S=128 does sign-bit duty (one step
+                  # past either last rank lands outside 0..127).
+                  if math::bit_and(y_to_sqr + r_step_vec + 1,
+                  |                micromax::s_no_square) <> 0 then
+                    unsafe(b_board)[y_to_sqr]
+                    | <- to_byte(math::bit_or(unsafe(b_board)[y_to_sqr], 7))
+                    i_capt_val <- i_capt_val + micromax::c_promo_bonus
+                  end if
+                end if
+
+                # --- Child hash keys: XOR out the mover at its old
+                # square, in at its new one, out the captured piece, and
+                # move the castling rook.  For one (square, piece) the
+                # index key and verify key are adjacent in _t_zobrist, so
+                # one zob_index serves both; shifts because multiply is
+                # slower on Chombit.  The unsafe() reads are in range:
+                # squares are 0..119 and piece codes are masked to 0..15,
+                # so the largest index is (119*16+15)*2+1 = 3839 < 4096
+                # (the castling stamp's kind 8 stays lower still).
+                new_piece <- unsafe(b_board)[y_to_sqr]
+
+                zob_index <- math::shift_left(math::shift_left(x_from_sqr, 4)
+                |                    + math::bit_and(u_piece, 15), 1)
+
+                j_delta <- unsafe(._t_zobrist)[zob_index]
+                z_delta <- unsafe(._t_zobrist)[zob_index + 1]
+
+                zob_index <- math::shift_left(math::shift_left(y_to_sqr, 4)
+                |                    + math::bit_and(new_piece, 15), 1)
+
+                j_delta <- math::bit_xor(j_delta,
+                | unsafe(._t_zobrist)[zob_index])
+
+                z_delta <- math::bit_xor(z_delta,
+                | unsafe(._t_zobrist)[zob_index + 1])
+
+                if t_victim <> 0 then
+                  zob_index <- math::shift_left(math::shift_left(h_capt_sqr, 4)
+                  |                    + math::bit_and(t_victim, 15), 1)
+
+                  j_delta <- math::bit_xor(j_delta,
+                  | unsafe(._t_zobrist)[zob_index])
+
+                  z_delta <- math::bit_xor(z_delta,
+                  | unsafe(._t_zobrist)[zob_index + 1])
+                end if
+
+                if math::bit_and(g_rook_sqr, micromax::m_off_board) = 0 then
+                  zob_index <- math::shift_left(math::shift_left(g_rook_sqr, 4)
+                  |                    + math::bit_and(k_side + 6, 15), 1)
+
+                  j_delta <- math::bit_xor(j_delta,
+                  | unsafe(._t_zobrist)[zob_index])
+
+                  z_delta <- math::bit_xor(z_delta,
+                  | unsafe(._t_zobrist)[zob_index + 1])
+
+                  zob_index <- math::shift_left(math::shift_left(f_skip_sqr, 4)
+                  |                    + math::bit_and(k_side + 6, 15), 1)
+
+                  j_delta <- math::bit_xor(j_delta,
+                  | unsafe(._t_zobrist)[zob_index])
+
+                  z_delta <- math::bit_xor(z_delta,
+                  | unsafe(._t_zobrist)[zob_index + 1])
+
+                  # Micro-Max folds castling into the verify key with
+                  # "+ G - S" (hash.html): a castled position must not
+                  # masquerade as the same placement reached by ordinary
+                  # moves.  The XOR analog stamps z_delta with the key of
+                  # piece kind 8 at the corner; kind 8 belongs to no real
+                  # piece, so the mark can never telescope away.  j_delta
+                  # stays unstamped: the stamp goes to one key only.
+                  z_delta <- math::bit_xor(z_delta, unsafe(._t_zobrist)[
+                  | math::shift_left(math::shift_left(g_rook_sqr, 4) + 8, 1)
+                  | + 1])
+                end if
+
+                # --- Recursive evaluation of the reply (minimax.html;
+                # child_alpha implements the delayed-gain trick of
+                # delay.html)
+                child_alpha <- -l_beta
+                if l_beta > e_eval
+                do child_alpha <- child_alpha - 1
+
+                if m_best_score > q_alpha then
+                  child_beta <- -m_best_score
+                else
+                  child_beta <- -q_alpha
+                end if
+
+                v_score <- - ._search(24 - k_side, child_alpha, child_beta,
+                | -e_eval - v_score - i_capt_val,
+                | math::bit_xor(j_hash_lo, j_delta),
+                | math::bit_xor(z_hash_hi, z_delta),
+                | f_skip_sqr, y_to_sqr, h_child_depth, ply + 1)
+
+                if v_score > e_eval
+                do v_score <- v_score - 1        # delayed-gain penalty
+
+                # --- Move-test mode: if this is the requested move and
+                # it doesn't lose the king, accept it: keep it on the
+                # board and signal success by returning l_beta (legal.html)
+                if z_last_to = 9 then
+                  if v_score <> -micromax::i_inf
+                  | and x_from_sqr = ._k_move_from
+                  | and y_to_sqr = ._l_move_to then
+                    ._q_root_eval <- -e_eval - i_capt_val
+                    ._o_ep <- to_byte(f_skip_sqr)
+                    return l_beta
+                  end if
+
+                  # Prevent fail-lows on king-capture replies
+                  v_score <- m_best_score
+                end if
+
+                # --- Counting mode: any move that doesn't lose the
+                # king counts, then falls through to the normal undo; this
+                # mode never commits.  Only the d_iter=2 iteration gets
+                # here, so each move is seen exactly once.
+                if z_last_to = 10 then
+                  if v_score <> -micromax::i_inf
+                  do ._legal_count <- ._legal_count + 1
+
+                  v_score <- m_best_score             # same guard as mode 9
+                end if
+
+                # --- FEATURE collect_moves: mode 10 for one pinned
+                # piece, also recording each target.  One piece has at
+                # most 27 moves, well inside the caller's buffer. ---
+                if z_last_to = 11 then
+                  if v_score <> -micromax::i_inf then
+                    ._list[._legal_count] <- ._to_api_square(to_byte(y_to_sqr))
+                    ._legal_count <- ._legal_count + 1
+                  end if
+
+                  v_score <- m_best_score             # same guard as mode 9
+                end if
+
+                # --- Undo the move; g_rook_sqr and f_skip_sqr may be
+                # the dummy square 128 (move.html)
+                unsafe(b_board)[g_rook_sqr] <- to_byte(k_side + 38)
+                unsafe(b_board)[f_skip_sqr] <- 0
+                unsafe(b_board)[y_to_sqr] <- 0
+                unsafe(b_board)[x_from_sqr] <- to_byte(u_piece)
+                unsafe(b_board)[h_capt_sqr] <- to_byte(t_victim)
+
+                # (Not in the original.)  Checked once per move searched,
+                # not per square scanned: after _stop, each live ply
+                # abandons its scan as soon as its current subtree
+                # returns, at zero cost on the hot path.
+                if ._stop
+                do drop 200
+
+                if math::bit_and(y_best_to, 8) <> 0 then
+                  # The best move is done.  Clear only its one-shot
+                  # request bit (Y&=~8); bit 7 must survive to
+                  # re-arm the request next iteration.  Then "goto A":
+                  # redo the ray normally from the start.
+                  m_best_score <- v_score
+                  y_best_to <- math::bit_xor(y_best_to, 8)
+
+                  y_to_sqr <- x_from_sqr
+                  f_skip_sqr <- micromax::s_no_square
+                  g_rook_sqr <- micromax::s_no_square
+                  lift 400
+                end if
+
+                if v_score > m_best_score then       # a new best move,
+                  m_best_score <- v_score            # marked with the S
+                  x_best_from <- x_from_sqr          # bit if not castling
+                  y_best_to <- math::bit_or(y_to_sqr,
+                  | math::bit_and(micromax::s_no_square, g_rook_sqr))
+                end if
+              end if
+
+              # --- Ray continuation control
+              if p_type < 5
+              do t_victim <- t_victim + 1    # fake capt: N and K stop here
+
+              # A pawn one step out of its home rank enables the double
+              # step (6*k+(y&V)==S); f_skip_sqr = the skipped square
+              # (ep.html)
+              if p_type < 3 and 6 * k_side
+              | + math::bit_and(y_to_sqr, micromax::v_rank_mask)
+              | = micromax::s_no_square then
+                f_skip_sqr <- y_to_sqr
+                t_victim <- t_victim - 1
+              elsif math::bit_and(u_piece, math::bit_not(24)) = 36
+              | and j_dir = 7
+              | and math::bit_and(g_rook_sqr, micromax::m_off_board) <> 0 then
+                # An unmoved king moving sideways on its first direction:
+                # check the corner rook (g_rook_sqr is assigned even when
+                # the checks fail, matching the b[G=(x|7)-(r>>1&7)] side
+                # effect).  (castle.html)
+                g_rook_sqr <- math::bit_or(x_from_sqr, 7)
+                if r_step_vec < 0
+                do g_rook_sqr <- g_rook_sqr - 7
+
+                if math::bit_and(unsafe(b_board)[g_rook_sqr],
+                |                micromax::unmoved) <> 0
+                | and unsafe(b_board)[math::bit_xor(g_rook_sqr, 1)] = 0
+                | and unsafe(b_board)[math::bit_xor(g_rook_sqr, 2)] = 0 then
+                  # Let the king ray continue one more step: that step
+                  # castles.
+                  f_skip_sqr <- y_to_sqr
+                  t_victim <- t_victim - 1
+                end if
+              end if
+
+              if t_victim <> 0
+              do drop 400 # capture (real or faked): ray ends
+            end loop 400
+          end loop 300
+        end if
+
+        # Next square, skipping the 0x88 half (x=x+9&~M)
+        x_from_sqr <- math::bit_and(x_from_sqr + 9, 119)
+        if x_from_sqr = b_start_sqr
+        do drop 200
+      end loop 200
+
+      # === "C:" (the fail-high target).  Mate scores don't depend on
+      # depth, so pin d_iter above every reachable n_depth.
+      if m_best_score > micromax::i_inf / 4
+      | or m_best_score < -micromax::i_inf / 4
+
+      do d_iter <- 99
+
+      # If even the best move loses the king, this is mate or stalemate:
+      # ask whether the opponent could capture the king right now
+      # (mate.html).
+      if m_best_score = -micromax::i_inf and not ._stop then
+        v_score <- ._search(24 - k_side,
+        | -micromax::i_inf, micromax::i_inf, 0, j_hash_lo, z_hash_hi,
+        | micromax::s_no_square, micromax::s_no_square, 1, ply + 1)
+
+        m_best_score <- (-v_score) / 2
+      end if
+
+      # === Store the result (replace.html).  The two schemes differ only
+      # in when to store; the store itself is shared below.
+      if micromax::classic_hash <> 0 then
+        # The 3.2 test (if(!a->K|(a->X&M)!=M|a->D<=d)): replace if
+        # new, or a better type, or deeper.
+        store_ok <- ._a_tt_key[a_slot] = 0
+        | or math::bit_and(._a_tt_from[a_slot], micromax::m_off_board)
+        |    <> micromax::m_off_board
+        | or ._a_tt_depth[a_slot] <= d_iter
+      else
+        # The pair probe already selected the victim, so store
+        # unconditionally, as 4.8 does.  (Adopted 4.x policy: a hit whose
+        # bound was unusable is overwritten at the new depth, where 3.2's
+        # test would have preserved a deeper exact result.)
+        store_ok <- true
+      end if
+
+      if store_ok then
+        ._a_tt_key[a_slot] <- z_hash_hi
+        ._a_tt_score[a_slot] <- m_best_score
+        ._a_tt_depth[a_slot] <- to_byte(d_iter)
+
+        # Classic only: re-blank slot 0, the permanently empty overflow
+        # dummy, in case a_slot fell back to it.
+        if micromax::classic_hash <> 0
+        do ._a_tt_key[0] <- 0
+
+        # The .X field packs the best-move hint with the bound type
+        # (8 = lower bound, 128 = upper bound, both = exact).
+        x_store_flags <- x_best_from
+        if m_best_score > q_alpha
+        do x_store_flags <- math::bit_or(x_store_flags, 8)
+
+        if m_best_score < l_beta
+        do x_store_flags <- math::bit_or(x_store_flags, 128)
+
+        ._a_tt_from[a_slot] <- to_byte(x_store_flags)
+        ._a_tt_to[a_slot] <- to_byte(y_best_to)
+      end if
+
+      if z_last_to = 8 and d_iter >= 2 and not ._stop then
+        ._k_move_from <- to_byte(x_best_from)
+        ._l_move_to <- to_byte(math::bit_and(y_best_to, 119))
+        .found_stat_depth <- d_iter
+        ._publish_proposal(m_best_score)
+        ._clock_active <- true
+      end if
+    end loop 100
+
+    # If a limit aborted an iteration partway, report the last completed
+    # iteration's move, score, and depth instead of the partial ones.
+    if z_last_to = 8 and ._stop then
+      x_best_from <- keep_from
+      y_best_to <- keep_to
+      m_best_score <- keep_score
+      .found_stat_depth <- keep_depth
+    end if
+
+    # Root calls report the best move found (mode 8 search, mode 9
+    # fallthrough when the requested move was not found).
+    if z_last_to = 8 or z_last_to = 9 then
+      ._k_move_from <- to_byte(x_best_from)
+      ._l_move_to <- to_byte(math::bit_and(y_best_to, 119))
+    end if
+
+    return m_best_score
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Publish (_k_move_from, _l_move_to) as the proposal, with the matching
+  # promotion piece and stats.
+  func _publish_proposal(score: int)
+    .found_source <- ._to_api_square(._k_move_from)
+    .found_target <- ._to_api_square(._l_move_to)
+
+    # A pawn proposal onto the last rank promotes, always to a queen here.
+    var mtype: int
+    mtype <- math::bit_and(._b_board[._k_move_from], 7)
+    if (mtype = 1 and ._l_move_to < 8)
+    | or (mtype = 2 and ._l_move_to >= 112) then
+      .found_promo <- piece_kind::queen
+    else
+      .found_promo <- piece_kind::none
+    end if
+
+    .found_stat_nodes <- ._n_nodes
+    .found_stat_score <- score    # mover's viewpoint, roughly centipawns
+  end func
+
+  # ---------------------------------------------------------------------------
+  # The root uses this to decide whether to start one more iteration.
+  func _can_search_more(): bool
+    if ._deadline_ms <> 0 and ._deadline_ms - io::clock_ms <= 0
+    do return false
+
+    if ._node_budget <> 0 and ._n_nodes >= ._node_budget
+    do return false
+
+    return true
+  end func
+
+  # ===========================================================================
+  # Probes and the verdict (.in_check / .status)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # True when "side" could capture the enemy king right now: a depth-1
+  # search fail-highs with i_inf before any move is even made (the
+  # i_capt_val < 0 test fires during the scan).
+  func _can_take_king(side: int): bool
+    ._clear_table()
+    return ._search(side, -micromax::i_inf, micromax::i_inf, 0, 1, 1,
+    | micromax::s_no_square, micromax::s_no_square, 1, 0) = micromax::i_inf
+  end func
+
+  # ---------------------------------------------------------------------------
+  # True when the side to move has at least one legal move: a mode-10
+  # counting search over all from-squares.  Having none is exactly the
+  # checkmate-or-stalemate condition.
+  func _has_legal_move(): bool
+    ._legal_count <- 0
+    ._clear_table()
+    ._search(._k_side, -micromax::i_inf, micromax::i_inf,
+    | ._q_root_eval, 1, 1, ._o_ep, 10, 2, 0)
+
+    return ._legal_count <> 0
+  end func
+
+  # ---------------------------------------------------------------------------
+  # Refresh .in_check and .status for the side to move; the tail of every
+  # successful try_move().  Every position here descends from the start
+  # through accepted moves, so the mover can never capture the enemy king
+  # and no guard for that case is needed.
+  func _refresh_verdict()
+    .in_check <- ._can_take_king(24 - ._k_side)
+    ._update_game_status(._has_legal_move())
+  end func
+
+  # ===========================================================================
+  # The chess_engine hooks
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Micro-Max's startup loop: wipe the board, deal the ranks, White to
+  # move, Q=0 (the start position is symmetric).
+  hook on_load_new_game()
+    var i: int
+    i <- 0
+    loop
+      if i >= 129
+      do drop
+
+      ._b_board[i] <- 0
+      i <- i + 1
+    end loop
+
+    i <- 0
+    loop
+      if i >= 8
+      do drop
+
+      # Back ranks: +40 = type + unmoved(32) + white(8) on the bottom
+      # rank, +48 = type + unmoved + black(16) on rank 0 (encode.html)
+      ._b_board[micromax::v_rank_mask + i]
+      | <- to_byte(micromax::o_initial_rank[i] + 40)
+
+      ._b_board[i] <- to_byte(micromax::o_initial_rank[i] + 48)
+
+      # Pawns: white (type 1 + 8) on rank 6, black (type 2 + 16) on rank 1.
+      ._b_board[96 + i] <- 9
+      ._b_board[16 + i] <- 18
+
+      i <- i + 1
+    end loop
+
+    ._k_side <- micromax::white
+    ._o_ep <- micromax::s_no_square
+    ._q_root_eval <- 0
+  end hook
+
+  # ---------------------------------------------------------------------------
+  # Validate and play one move: Micro-Max's main() input path,
+  # D(...,9,2) == I (legal.html).  The mode-9 search hunts for the
+  # requested move among the moves it generates; finding it (and surviving
+  # king safety) commits it on the board, returns i_inf, and updates Q and O.
+  hook on_try_move(source: square, target: square, promo: piece_kind): bool
+    var mf: byte, mt: byte, mtype: int
+    mf <- ._to_micromax_square(source)
+    mt <- ._to_micromax_square(target)
+    mtype <- math::bit_and(._b_board[mf], 7)
+
+    # Internal last ranks: 0..7 for the white pawn (type 1), 112..119 for
+    # the black.
+    var promoting: bool
+    promoting <- (mtype = 1 and mt < 8) or (mtype = 2 and mt >= 112)
+    if promoting then
+      if promo <> piece_kind::queen
+      do return false
+
+    elsif promo <> piece_kind::none then
+      return false
+    end if
+
+    var victim: byte, captured: bool, pawn_move: bool, was_ep: bool
+    pawn_move <- mtype = 1 or mtype = 2
+    victim <- ._b_board[mt]
+    was_ep <- pawn_move and mt = ._o_ep and victim = 0
+    if was_ep
+    do victim <- ._b_board[math::bit_xor(mt, 16)]
+
+    captured <- victim <> 0
+
+    # --- FEATURE undo_move: facts the token needs, read before the
+    # search commits the move. ---
+    var mover_piece: byte, prev_ep: byte
+    mover_piece <- ._b_board[mf]
+    prev_ep <- ._o_ep
+    # --- end FEATURE undo_move ---
+
+    var mover_was_black: bool
+    mover_was_black <- ._k_side = micromax::black
+
+    # The mode-9 search.  On success it leaves the move played and
+    # returns l_beta (= i_inf here).
+    ._clear_table()
+    ._k_move_from <- mf
+    ._l_move_to <- mt
+    var result: int
+    result <- ._search(._k_side, -micromax::i_inf, micromax::i_inf,
+    | ._q_root_eval, 1, 1, ._o_ep, 9, 2, 0)
+
+    if result <> micromax::i_inf
+    do return false
+
+    # Committed: flip the side to move (k^=24) and publish.
+    ._k_side <- to_byte(math::bit_xor(._k_side, 24))
+
+    # --- FEATURE undo_move: pack the token that reverses this move; see
+    # undo_move() for the layout.  .position.halfmove_clock still holds
+    # its pre-move value here. ---
+    var token: int
+    token <- .position.halfmove_clock
+    token <- math::bit_or(token, math::shift_left(prev_ep, 8))
+    token <- math::bit_or(token,
+    | math::shift_left(math::bit_and(victim, 7), 16))
+
+    if math::bit_and(victim, micromax::unmoved) <> 0
+    do token <- math::bit_or(token, $0008_0000)
+
+    if math::bit_and(mover_piece, micromax::unmoved) <> 0
+    do token <- math::bit_or(token, $0010_0000)
+
+    if promoting
+    do token <- math::bit_or(token, $0020_0000)
+
+    if was_ep
+    do token <- math::bit_or(token, $0040_0000)
+
+    .last_undo_token <- token
+    # --- end FEATURE undo_move ---
+
+    # The halfmove clock saturates at 255 (the contract's sentinel for an
+    # unlikely count >= 255) instead of wrapping.
+    if pawn_move or captured then
+      .position.halfmove_clock <- 0
+    elsif .position.halfmove_clock < 255 then
+      .position.halfmove_clock <- to_byte(.position.halfmove_clock + 1)
+    end if
+
+    if mover_was_black
+    do .position.fullmove_number <- .position.fullmove_number + 1
+
+    # The wrapper cleared last_captured; report the direct victim, if any.
+    if captured
+    do .last_captured <- ._to_api_piece(victim)
+
+    ._project_position()
+    ._refresh_verdict()
+    return true
+  end hook
+
+  # ===========================================================================
+  # FEATURE undo_move
+  # ---------------------------------------------------------------------------
+  # Reverse the most recent successful try_move().  Micro-Max has no
+  # game-level undo (it replays games from scratch instead); this func
+  # lives entirely outside the search, touching only what a committed
+  # mode-9 move wrote: the board, _k_side, _o_ep, and _q_root_eval.
+  #
+  # last_undo_token layout (bits 23..31 stay clear, so tokens are
+  # non-negative):
+  #
+  #   bits  0..7   halfmove_clock before the move (255 = saturated)
+  #   bits  8..15  internal _o_ep before the move (128 = s_no_square)
+  #   bits 16..18  the victim's internal piece type, 0 = no capture
+  #   bit  19      the victim was still unmoved
+  #   bit  20      the mover was still unmoved
+  #   bit  21      the move was a promotion
+  #   bit  22      the move was an en-passant capture
+  #
+  # The two unmoved bits keep castling rights honest: capturing a rook
+  # that had never moved and then undoing must restore its bit, or
+  # _get_castling_mask() silently drops that right for the rest of the game.
+  # _q_root_eval needs no bits; see the reversal below.
+  hook undo_move(source: square, target: square, token: int)
+    var mf: byte, mt: byte
+    mf <- ._to_micromax_square(source)
+    mt <- ._to_micromax_square(target)
+
+    # Decode the token.
+    var clock: byte, prev_ep: byte, victim_type: int
+    var victim_unmoved: bool, mover_unmoved: bool
+    var was_promo: bool, was_ep: bool
+    clock <- to_byte(math::bit_and(token, 255))
+    prev_ep <- to_byte(math::bit_and(
+    | math::shift_right_unsigned(token, 8), 255))
+
+    victim_type <- math::bit_and(math::shift_right_unsigned(token, 16), 7)
+    victim_unmoved <- math::bit_and(token, $0008_0000) <> 0
+    mover_unmoved <- math::bit_and(token, $0010_0000) <> 0
+    was_promo <- math::bit_and(token, $0020_0000) <> 0
+    was_ep <- math::bit_and(token, $0040_0000) <> 0
+
+    # The move flipped _k_side, so the mover is the side no longer on
+    # move, and the victim belonged to the side now on move.
+    var mover: byte, enemy: byte
+    enemy <- ._k_side
+    mover <- to_byte(math::bit_xor(._k_side, 24))
+
+    # Catch some obvious problems (inputs are otherwise trusted).
+    if ._b_board[mf] <> 0
+    do kernel::fail("undo_move: source square is occupied")
+
+    if math::bit_and(._b_board[mt], mover) = 0
+    do kernel::fail("undo_move: target is not the mover's piece")
+
+    # Castling: the king's only two-square move.  Carry the rook from the
+    # transit square (mf + mt) / 2 back to its corner and mark it unmoved
+    # again (the mirror of the original's undo write b[G]=k+38); the
+    # king's own bit returns via mover_unmoved below.
+    var mtype: int
+    mtype <- math::bit_and(._b_board[mt], 7)
+    if mtype = 4 and (mt = mf + 2 or mf = mt + 2) then
+      ._b_board[(mf + mt) / 2] <- 0
+      if mt = mf + 2 then
+        ._b_board[mf + 3] <- to_byte(mover + 38)
+      else
+        ._b_board[mf - 4] <- to_byte(mover + 38)
+      end if
+    end if
+
+    # The mover returns home: a promoted piece degrades back to the
+    # mover's pawn type (white 1 / black 2), and the unmoved bit returns
+    # if the token says it was there.
+    var restored: byte
+    if was_promo then
+      if mover = micromax::white then
+        restored <- 1 + micromax::white
+      else
+        restored <- 2 + micromax::black
+      end if
+    else
+      restored <- ._b_board[mt]
+    end if
+
+    if mover_unmoved
+    do restored <- to_byte(math::bit_or(restored, micromax::unmoved))
+
+    ._b_board[mf] <- restored
+
+    # The victim returns: beside the target for en passant, onto it
+    # otherwise (victim_type 0 restores an empty square).
+    var victim: byte
+    victim <- 0
+    if victim_type <> 0 then
+      victim <- to_byte(victim_type + enemy)
+      if victim_unmoved
+      do victim <- to_byte(math::bit_or(victim, micromax::unmoved))
+    end if
+
+    if was_ep then
+      ._b_board[mt] <- 0
+      ._b_board[math::bit_xor(mt, 16)] <- victim
+    else
+      ._b_board[mt] <- victim
+    end if
+
+    # Reverse the scalar state: side, en passant, and the running eval
+    # (Q_old=-Q_new-i, with i the captured value of this move).
+    ._k_side <- mover
+    ._o_ep <- prev_ep
+
+    var i_capt_val: int
+    i_capt_val <- micromax::score_unit
+    | * micromax::w_piece_values[victim_type]
+
+    if was_promo
+    do i_capt_val <- i_capt_val + micromax::c_promo_bonus
+
+    ._q_root_eval <- - ._q_root_eval - i_capt_val
+
+    # Restore the counters the search never tracked, then run the same
+    # tail as try_move().  A saturated clock restores as 255, since that
+    # sentinel is deliberately sticky (see the chess_position docs).
+    .position.halfmove_clock <- clock
+    if mover = micromax::black
+    do .position.fullmove_number <- .position.fullmove_number - 1
+
+    ._project_position()
+    ._refresh_verdict()
+
+    # Per the contract, these two reset rather than restore.
+    .last_undo_token <- 0
+    .last_captured <- piece_kind::none
+  end hook
+  # --- end FEATURE undo_move ---
+
+  # ===========================================================================
+  # FEATURE collect_moves
+  # ---------------------------------------------------------------------------
+  # Enumerate the legal targets of one piece, for GUI highlighting: the
+  # same depth-2 pass as a mode-9 move test, but recording every generated
+  # move that survives king safety, and never committing.  Costs one
+  # search per call, so a GUI can call it on every click.
+  #
+  # To delete this feature, remove every block marked FEATURE
+  # collect_moves, plus the can_collect_moves flag.
+  hook collect_moves(source: square, targets: square[size 64]): int
+    if .status <> game_status::playing
+    do return 0
+
+    if source >= 64
+    do return 0
+
+    # The contract allows any square here, so answer for an empty or
+    # enemy square without paying for a search.
+    var mf: byte
+    mf <- ._to_micromax_square(source)
+    if math::bit_and(._b_board[mf], ._k_side) = 0
+    do return 0
+
+    ._list <- targets
+    ._list_from <- mf
+    ._legal_count <- 0
+    ._clear_table()
+    ._search(._k_side, -micromax::i_inf, micromax::i_inf,
+    | ._q_root_eval, 1, 1, ._o_ep, 11, 2, 0)
+
+    ._list <- null    # don't retain the caller's buffer
+
+    return to_byte(._legal_count)
+  end hook
+  # --- end FEATURE collect_moves ---
+
+  # ---------------------------------------------------------------------------
+  # Search for a move: Micro-Max's D(...,8,0) root call under iterative
+  # deepening.  A proposal always exists before either limit can stop
+  # anything (see the time-control members); after that, a limit only
+  # costs the partial iteration.
+  hook find_move(deadline_clock_ms: int, node_budget: int,
+  | on_progress: find_on_progress)
+    ._reset_find_outputs()
+
+    if .status <> game_status::playing
+    do return                 # no legal move exists; propose nothing
+
+    ._deadline_ms <- deadline_clock_ms
+    ._node_budget <- node_budget
+    ._on_progress <- on_progress
+    ._n_nodes <- 0
+    ._hit_count <- 0
+    ._stop <- false
+    ._stop_wanted <- false
+    ._clock_active <- false   # armed by the root after a proposing iteration
+
+    ._clear_table()
+    var score: int
+    score <- ._search(._k_side, -micromax::i_inf, micromax::i_inf,
+    | ._q_root_eval, 1, 1, ._o_ep, 8, 0, 0)
+
+    ._clock_active <- false
+    ._stop <- false
+    ._stop_wanted <- false
+    ._on_progress <- null
+
+    ._publish_proposal(score)
+  end hook
+end class

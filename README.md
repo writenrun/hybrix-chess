@@ -1,6 +1,6 @@
 # Hybrix Chess
 
-Source code for the Chombit Chess video game, an API for chess-playing engines, and a console for testing engines. Everything is written in the [Hybrix language](https://www.hybrix.dev/docs/compiler).
+Source code for the Chombit Chess video game, an API for chess-playing engines, a port of the Micro-Max algorithm, and a console for testing engines. Everything is written in the [Hybrix language](https://www.hybrix.dev/docs/compiler).
 
 **What is Hybrix?** Hybrix is an educational virtual computer with an emulator and full development environment that run in your web browser. Its custom 32-bit CPU executes [2,400,000 instructions per second](https://www.hybrix.dev/docs/machine/architecture/timing) with only [256 kilobytes of RAM](https://www.hybrix.dev/docs/machine/architecture/memory_regions). Like a classic computer, these specs encourage programs that a single person can understand with minimal reliance on frameworks. Deterministic [CPU timings](https://www.hybrix.dev/docs/assembler/intro) allow performance to be measured precisely and reproducibly. These qualities make it an interesting platform for coding chess algorithms.
 
@@ -13,7 +13,7 @@ Source code for the Chombit Chess video game, an API for chess-playing engines, 
   </a>
 </td></tr></table>
 
-A full chess video game: pieces on a perspective board, a mouse-driven wand for picking squares, legal destinations highlighted on selection, and a status bar for undo, new game, and switching either side between Human and Robot. The Robot uses [Micro-Max](https://home.hccnet.nl/h.g.muller/max-src2.html) by H.G. Muller, ported to Hybrix with his permission; the source is not yet included in this repository. Difficulty controls the search time (Easy = 2 secs, Medium = 8 secs, Hard = 30 secs). Artwork and sound resources are in the Hybrix Designer's native formats, but will be made inspectable later.
+A full chess video game: pieces on a perspective board, a mouse-driven wand for picking squares, legal destinations highlighted on selection, and a status bar for undo, new game, and switching either side between Human and Robot. The Robot uses Micro-Max (see below), with difficulty controlling the search time (Easy = 2 secs, Medium = 8 secs, Hard = 30 secs). Artwork and sound resources are in the Hybrix Designer's native formats, but will be made inspectable later.
 
 For more details about this game, see [the Hybrix website docs](https://www.hybrix.dev/ref/chess-demo).
 
@@ -48,6 +48,26 @@ The `reference_chess_engine` class implements all four features, using the ortho
 | [engine-api/reference_chess_engine.hyb](./engine-api/reference_chess_engine.hyb) | Reference subclass implementing all four features              |
 
 To write your own engine, subclass `chess_engine`, set the `can_` flags for the features you support, then fill in the hooks. If it plays well, we may incorporate it into the official Chombit Chess game as an alternate computer player.
+
+## Micro-Max
+
+H.G. Muller's Micro-Max is a well-known chess program that fits in only 2,000 characters of C source code. We've ported version 3.2 to Hybrix with his permission; details in [this TalkChess thread](https://talkchess.com/viewtopic.php?t=86409).
+
+The algorithm is well explained by the author's own documentation:
+
+- [Annotated source](https://home.hccnet.nl/h.g.muller/max-src2.html)
+- [Every variable, indexed](https://home.hccnet.nl/h.g.muller/var.html)
+- [Long-name rewrite of 3.2](https://home.hccnet.nl/h.g.muller/maximax.txt)
+
+Fitting the algorithm into 256 kilobytes required a few departures from the original:
+
+- The transposition table holds 8,192 entries rather than millions. Two probe and replacement schemes are compiled in and selected by a constant: the original 3.2 scan of consecutive slots, and the shallowest-of-two replacement that Muller recommended for a table this small.
+- `load_position()` is omitted, because Micro-Max state cannot be rebuilt exactly from a `chess_position` record. A game begins at `load_new_game()` and continues through accepted moves.
+- Micro-Max traits are preserved rather than modernized. A pawn always promotes to a queen, for example.
+
+| Filename                                         | Description                                 |
+| ------------------------------------------------ | ------------------------------------------- |
+| [micromax/micromax.hyb](./micromax/micromax.hyb) | Micro-Max 3.2 ported to the Hybrix language |
 
 ## Chess Console
 
